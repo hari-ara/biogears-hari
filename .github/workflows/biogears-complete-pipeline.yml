@@ -120,6 +120,10 @@ jobs:
           if [ -f "docker/release/Dockerfile" ]; then
             echo "Using docker/release/Dockerfile for building BioGears"
             
+            # Add debugging output
+            echo "Original release Dockerfile contents:"
+            cat docker/release/Dockerfile
+            
             # Create a temporary modified version that uses our external image
             echo "Creating modified builder Dockerfile"
             mkdir -p docker/modified
@@ -129,12 +133,19 @@ jobs:
             echo "Modified Dockerfile contents:"
             cat docker/modified/Dockerfile.builder
             
+            # Add additional debug info
+            echo "Current working directory:"
+            pwd
+            echo "Available Docker images:"
+            docker images
+            
             # Attempt to build with the project's Dockerfile
             echo "Building BioGears using modified project Dockerfile..."
             docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
               -f docker/modified/Dockerfile.builder \
               . || {
                 echo "Real build failed, creating dummy builder image instead"
+                echo "Docker build failed with exit code $?"
                 
                 # Create a simple builder Dockerfile that doesn't try to build the actual project
                 echo "FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest" > docker/biogears/Dockerfile.builder
