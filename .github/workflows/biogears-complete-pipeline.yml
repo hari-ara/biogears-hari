@@ -107,12 +107,15 @@ jobs:
             echo "RUN chmod -R 777 /opt/biogears/core/build" >> docker/modified/Dockerfile.builder
             
             # Add newer compiler support for C++20
-            echo "# Install newer compiler with C++20 support" >> docker/modified/Dockerfile.builder
-            echo "RUN apt-get update && apt-get install -y software-properties-common" >> docker/modified/Dockerfile.builder
-            echo "RUN add-apt-repository ppa:ubuntu-toolchain-r/test -y" >> docker/modified/Dockerfile.builder
-            echo "RUN apt-get update && apt-get install -y gcc-11 g++-11" >> docker/modified/Dockerfile.builder
-            echo "RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 --slave /usr/bin/g++ g++ /usr/bin/g++-11" >> docker/modified/Dockerfile.builder
-            echo "RUN gcc --version && g++ --version" >> docker/modified/Dockerfile.builder
+            echo "# --- Install GCC 11 and set it as default ---" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-get update && \\" >> docker/modified/Dockerfile.builder
+            echo "    apt-get install -y software-properties-common && \\" >> docker/modified/Dockerfile.builder
+            echo "    add-apt-repository ppa:ubuntu-toolchain-r/test -y && \\" >> docker/modified/Dockerfile.builder
+            echo "    apt-get update && \\" >> docker/modified/Dockerfile.builder
+            echo "    apt-get install -y gcc-11 g++-11 && \\" >> docker/modified/Dockerfile.builder
+            echo "    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 && \\" >> docker/modified/Dockerfile.builder
+            echo "    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-11 100 && \\" >> docker/modified/Dockerfile.builder
+            echo "    gcc --version && g++ --version" >> docker/modified/Dockerfile.builder
             
             # Upgraded CMake for better C++20 support
             echo "# Install newer CMake for better C++20 support" >> docker/modified/Dockerfile.builder
@@ -173,12 +176,15 @@ jobs:
             echo "RUN chmod -R 777 /opt/biogears/core/build" >> docker/modified/Dockerfile.builder
             
             # Add newer compiler support for C++20
-            echo "# Install newer compiler with C++20 support" >> docker/modified/Dockerfile.builder
-            echo "RUN apt-get update && apt-get install -y software-properties-common" >> docker/modified/Dockerfile.builder
-            echo "RUN add-apt-repository ppa:ubuntu-toolchain-r/test -y" >> docker/modified/Dockerfile.builder
-            echo "RUN apt-get update && apt-get install -y gcc-11 g++-11" >> docker/modified/Dockerfile.builder
-            echo "RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 --slave /usr/bin/g++ g++ /usr/bin/g++-11" >> docker/modified/Dockerfile.builder
-            echo "RUN gcc --version && g++ --version" >> docker/modified/Dockerfile.builder
+            echo "# --- Install GCC 11 and set it as default ---" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-get update && \\" >> docker/modified/Dockerfile.builder
+            echo "    apt-get install -y software-properties-common && \\" >> docker/modified/Dockerfile.builder
+            echo "    add-apt-repository ppa:ubuntu-toolchain-r/test -y && \\" >> docker/modified/Dockerfile.builder
+            echo "    apt-get update && \\" >> docker/modified/Dockerfile.builder
+            echo "    apt-get install -y gcc-11 g++-11 && \\" >> docker/modified/Dockerfile.builder
+            echo "    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 && \\" >> docker/modified/Dockerfile.builder
+            echo "    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-11 100 && \\" >> docker/modified/Dockerfile.builder
+            echo "    gcc --version && g++ --version" >> docker/modified/Dockerfile.builder
             
             # Upgraded CMake for better C++20 support
             echo "# Install newer CMake for better C++20 support" >> docker/modified/Dockerfile.builder
