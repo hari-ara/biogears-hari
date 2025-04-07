@@ -62,6 +62,10 @@ jobs:
           # Create a simple external base image Dockerfile
           echo "FROM ubuntu:20.04" > docker/biogears/Dockerfile.external
           echo "" >> docker/biogears/Dockerfile.external
+          echo "# Set non-interactive mode for apt" >> docker/biogears/Dockerfile.external
+          echo "ENV DEBIAN_FRONTEND=noninteractive" >> docker/biogears/Dockerfile.external
+          echo "ENV TZ=Etc/UTC" >> docker/biogears/Dockerfile.external
+          echo "" >> docker/biogears/Dockerfile.external
           echo "# Install basic dependencies" >> docker/biogears/Dockerfile.external
           echo "RUN apt-get update && \\" >> docker/biogears/Dockerfile.external
           echo "    apt-get install -y \\" >> docker/biogears/Dockerfile.external
@@ -255,11 +259,14 @@ jobs:
           cat > docker-context/Dockerfile << EOF
           FROM ubuntu:20.04
           
-          RUN apt-get update && \
-              apt-get install -y --no-install-recommends \
-                liblog4cpp5 \
-                libxerces-c3.2 \
-                ca-certificates \
+          ENV DEBIAN_FRONTEND=noninteractive
+          ENV TZ=Etc/UTC
+          
+          RUN apt-get update && \\
+              apt-get install -y --no-install-recommends \\
+                liblog4cpp5 \\
+                libxerces-c3.2 \\
+                ca-certificates \\
                 && rm -rf /var/lib/apt/lists/*
           
           COPY lib/ /usr/local/lib/
