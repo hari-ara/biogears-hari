@@ -282,16 +282,14 @@ jobs:
           # Create a simple build metadata file if it doesn't exist
           if [ ! -f "build-output/build-metadata.json" ]; then
             echo "Creating dummy build-metadata.json"
-            cat > build-output/build-metadata.json << EOF
-            {
-              "builder_id": "github-actions-docker",
-              "build_type": "Release",
-              "source_repo": "${{ github.server_url }}/${{ github.repository }}",
-              "commit_hash": "${{ github.sha }}",
-              "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-              "build_platform": "linux"
-            }
-            EOF
+            echo '{' > build-output/build-metadata.json
+            echo '  "builder_id": "github-actions-docker",' >> build-output/build-metadata.json
+            echo '  "build_type": "Release",' >> build-output/build-metadata.json
+            echo '  "source_repo": "${{ github.server_url }}/${{ github.repository }}",' >> build-output/build-metadata.json
+            echo '  "commit_hash": "${{ github.sha }}",' >> build-output/build-metadata.json
+            echo '  "build_timestamp": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",' >> build-output/build-metadata.json
+            echo '  "build_platform": "linux"' >> build-output/build-metadata.json
+            echo '}' >> build-output/build-metadata.json
           fi
 
           # Copy files with error handling
@@ -308,7 +306,8 @@ jobs:
             cp -r build-output/bin/* docker-context/bin/ || echo "Failed to copy bin directory contents"
           else
             echo "Creating dummy executable"
-            echo -e "#!/bin/bash\necho 'BioGears CLI Simulator'" > docker-context/bin/bg-cli
+            echo '#!/bin/bash' > docker-context/bin/bg-cli
+            echo 'echo "BioGears CLI Simulator"' >> docker-context/bin/bg-cli
             chmod +x docker-context/bin/bg-cli
           fi
           
@@ -319,30 +318,28 @@ jobs:
           find docker-context -type f | sort
           
           # Create Dockerfile for BioGears runtime
-          cat > docker-context/Dockerfile << EOF
-          FROM ubuntu:20.04
-          
-          ENV DEBIAN_FRONTEND=noninteractive
-          ENV TZ=Etc/UTC
-          
-          RUN apt-get update && \\
-              apt-get install -y --no-install-recommends \\
-                liblog4cpp5 \\
-                libxerces-c3.2 \\
-                ca-certificates \\
-                && rm -rf /var/lib/apt/lists/*
-          
-          COPY lib/ /usr/local/lib/
-          COPY bin/ /usr/local/bin/
-          COPY build-metadata.json /opt/biogears/build-metadata.json
-          
-          ENV LD_LIBRARY_PATH=/usr/local/lib
-          
-          # Make sure binaries are executable
-          RUN chmod +x /usr/local/bin/* || echo "No binaries to make executable"
-          
-          ENTRYPOINT ["/bin/bash", "-c", "if [ -x /usr/local/bin/bg-cli ]; then /usr/local/bin/bg-cli; else echo 'BioGears CLI Simulator'; fi"]
-          EOF
+          echo 'FROM ubuntu:20.04' > docker-context/Dockerfile
+          echo '' >> docker-context/Dockerfile
+          echo 'ENV DEBIAN_FRONTEND=noninteractive' >> docker-context/Dockerfile
+          echo 'ENV TZ=Etc/UTC' >> docker-context/Dockerfile
+          echo '' >> docker-context/Dockerfile
+          echo 'RUN apt-get update && \' >> docker-context/Dockerfile
+          echo '    apt-get install -y --no-install-recommends \' >> docker-context/Dockerfile
+          echo '    liblog4cpp5 \' >> docker-context/Dockerfile
+          echo '    libxerces-c3.2 \' >> docker-context/Dockerfile
+          echo '    ca-certificates \' >> docker-context/Dockerfile
+          echo '    && rm -rf /var/lib/apt/lists/*' >> docker-context/Dockerfile
+          echo '' >> docker-context/Dockerfile
+          echo 'COPY lib/ /usr/local/lib/' >> docker-context/Dockerfile
+          echo 'COPY bin/ /usr/local/bin/' >> docker-context/Dockerfile
+          echo 'COPY build-metadata.json /opt/biogears/build-metadata.json' >> docker-context/Dockerfile
+          echo '' >> docker-context/Dockerfile
+          echo 'ENV LD_LIBRARY_PATH=/usr/local/lib' >> docker-context/Dockerfile
+          echo '' >> docker-context/Dockerfile
+          echo '# Make sure binaries are executable' >> docker-context/Dockerfile
+          echo 'RUN chmod +x /usr/local/bin/* || echo "No binaries to make executable"' >> docker-context/Dockerfile
+          echo '' >> docker-context/Dockerfile
+          echo 'ENTRYPOINT ["/bin/bash", "-c", "if [ -x /usr/local/bin/bg-cli ]; then /usr/local/bin/bg-cli; else echo BioGears CLI Simulator; fi"]' >> docker-context/Dockerfile
           
           echo "Dockerfile contents:"
           cat docker-context/Dockerfile
