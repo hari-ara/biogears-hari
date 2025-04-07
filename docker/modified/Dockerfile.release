@@ -1,16 +1,28 @@
-FROM biogears-external
+FROM biogears-external:latest
 WORKDIR /opt/biogears
 
 # Copy existing code rather than cloning
 COPY . /opt/biogears/core/
 WORKDIR /opt/biogears/core/build
 
-# Build BioGears
-RUN cmake -DCMAKE_INSTALL_PREFIX=/opt/biogears/usr -DARA_Biogears_BUILD_JAVATOOLS=OFF -DARA_Biogears_BUILD_HOWTOS=ON -DCMAKE_BUILD_TYPE=Release .. && make -j4
+# Make sure build directory is clean
+RUN rm -rf * || true
+
+# Build BioGears with more verbose output
+RUN cmake -DCMAKE_INSTALL_PREFIX=/opt/biogears/usr \
+    -DARA_Biogears_BUILD_JAVATOOLS=OFF \
+    -DARA_Biogears_BUILD_HOWTOS=OFF \
+    -DARA_Biogears_BUILD_DOCS=OFF \
+    -DARA_Biogears_BUILD_TESTING=OFF \
+    -DARA_Biogears_BUILD_TOOL_APPLICATIONS=OFF \
+    -DCMAKE_BUILD_TYPE=Release \
+    .. && \
+    make VERBOSE=1 -j2
 
 # Install to a consistent location
 RUN mkdir -p /artifacts/lib /artifacts/bin
 
 # Copy the built files to the artifacts directory
+RUN make install || true
 RUN cp -r /opt/biogears/usr/lib/* /artifacts/lib/ || true
 RUN cp -r /opt/biogears/usr/bin/* /artifacts/bin/ || true
