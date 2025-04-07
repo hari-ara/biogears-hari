@@ -23,6 +23,25 @@ jobs:
         with:
           fetch-depth: 0
       
+      - name: Debug repository structure
+        run: |
+          echo "Checking repository structure..."
+          echo "Root directory:"
+          ls -la
+          echo "Docker directory structure (if exists):"
+          find . -name "Dockerfile" | sort
+          echo "Docker directory contents (if exists):"
+          [ -d "docker" ] && ls -la docker/ || echo "No docker directory found"
+          echo "Checking subdirectories for Docker files:"
+          for dir in */; do
+            echo "Contents of $dir:"
+            ls -la "$dir" || echo "Failed to list $dir"
+            if [ -d "$dir/docker" ]; then
+              echo "Docker directory in $dir:"
+              ls -la "$dir/docker"
+            fi
+          done
+      
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
       
@@ -35,67 +54,85 @@ jobs:
       
       - name: Build External Base Image
         run: |
-          # Build the external dependencies image first
-          echo "Building biogears-external image..."
+          # Debug what Docker files exist
+          echo "Looking for external Dockerfile..."
+          EXTERNAL_DOCKERFILE=$(find . -name "Dockerfile" -path "*/external/*" | head -n 1)
           
-          docker build -t ghcr.io/${{ github.repository_owner }}/biogears-external:latest --progress=plain -f docker/external/Dockerfile docker/external
+          if [ -z "$EXTERNAL_DOCKERFILE" ]; then
+            echo "No external Dockerfile found, looking for any Dockerfile..."
+            EXTERNAL_DOCKERFILE=$(find . -name "Dockerfile" | grep -v "context" | head -n 1)
+            
+            if [ -z "$EXTERNAL_DOCKERFILE" ]; then
+              echo "ERROR: No Dockerfile found for external dependencies"
+              exit 1
+            fi
+          fi
+          
+          echo "Using Dockerfile at: $EXTERNAL_DOCKERFILE"
+          DOCKERFILE_DIR=$(dirname "$EXTERNAL_DOCKERFILE")
+          
+          # Build the external dependencies image
+          echo "Building biogears-external image..."
+          docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest \
+            --progress=plain \
+            -f "$EXTERNAL_DOCKERFILE" "$DOCKERFILE_DIR"
           
           # Tag with date-based version
           SHORT_SHA="${{ github.sha }}"
           DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
-          docker tag ghcr.io/${{ github.repository_owner }}/biogears-external:latest ghcr.io/${{ github.repository_owner }}/biogears-external:${DATE_VERSION}
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest ghcr.io/${{ github.repository_owner }}/biogears-hari-external:${DATE_VERSION}
           
           # Get image digest
-          EXTERNAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-external:latest | cut -d'@' -f2 || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-external:latest)
+          EXTERNAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest 2>/dev/null || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest)
           echo "EXTERNAL_DIGEST=$EXTERNAL_DIGEST" > image-digests.txt
           echo "EXTERNAL_VERSION=$DATE_VERSION" >> image-digests.txt
+          echo "EXTERNAL_DOCKERFILE=$EXTERNAL_DOCKERFILE" >> image-digests.txt
           echo "External image digest: $EXTERNAL_DIGEST"
       
       - name: Build BioGears with Docker
         run: |
+          source image-digests.txt
+          
+          # Debug what Docker files exist for builder
+          echo "Looking for builder/release Dockerfile..."
+          BUILDER_DOCKERFILE=$(find . -name "Dockerfile" -path "*/release/*" -o -name "Dockerfile" -path "*/builder/*" | head -n 1)
+          
+          if [ -z "$BUILDER_DOCKERFILE" ]; then
+            echo "No builder Dockerfile found, looking for any other Dockerfile..."
+            BUILDER_DOCKERFILE=$(find . -name "Dockerfile" | grep -v "context" | grep -v "$EXTERNAL_DOCKERFILE" | head -n 1)
+            
+            if [ -z "$BUILDER_DOCKERFILE" ]; then
+              echo "ERROR: No Dockerfile found for BioGears builder"
+              exit 1
+            fi
+          fi
+          
+          echo "Using Dockerfile at: $BUILDER_DOCKERFILE"
+          DOCKERFILE_DIR=$(dirname "$BUILDER_DOCKERFILE")
+          
           # Build the BioGears builder image
           echo "Building biogears-builder image..."
-          
-          if [ -f "docker/release/Dockerfile" ]; then
-            echo "Building with docker/release/Dockerfile..."
-            docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
-              --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
-              --progress=plain \
-              -f docker/release/Dockerfile .
-          elif [ -f "docker/builder/Dockerfile" ]; then
-            echo "Building with docker/builder/Dockerfile..."
-            docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
-              --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
-              --progress=plain \
-              -f docker/builder/Dockerfile .
-          else
-            # Find a suitable Dockerfile
-            echo "Looking for a suitable Dockerfile..."
-            for df in $(find docker -name "Dockerfile" | grep -v external); do
-              echo "Found Dockerfile: $df"
-              docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
-                --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
-                --progress=plain \
-                -f $df .
-              break
-            done
-          fi
+          docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
+            --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest \
+            --progress=plain \
+            -f "$BUILDER_DOCKERFILE" .
           
           # Tag with date-based version
           SHORT_SHA="${{ github.sha }}"
           DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
-          docker tag ghcr.io/${{ github.repository_owner }}/biogears-builder:latest ghcr.io/${{ github.repository_owner }}/biogears-builder:${DATE_VERSION}
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:${DATE_VERSION}
           
           # Get image digest
-          BUILDER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-builder:latest | cut -d'@' -f2 || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-builder:latest)
+          BUILDER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest 2>/dev/null || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest)
           echo "BUILDER_DIGEST=$BUILDER_DIGEST" >> image-digests.txt
           echo "BUILDER_VERSION=$DATE_VERSION" >> image-digests.txt
+          echo "BUILDER_DOCKERFILE=$BUILDER_DOCKERFILE" >> image-digests.txt
           echo "Builder image digest: $BUILDER_DIGEST"
       
       - name: Extract built artifacts from Docker image
         run: |
           # Create a temporary container to extract artifacts from
-          CONTAINER_ID=$(docker create ghcr.io/${{ github.repository_owner }}/biogears-builder:latest)
+          CONTAINER_ID=$(docker create ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest)
           
           # Create directories for extracted files
           mkdir -p build/lib build/bin
@@ -207,13 +244,13 @@ jobs:
         with:
           context: docker-context
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/biogears:${{ github.sha }}
+          tags: ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
       
       - name: Get image digest
         id: image_digest
         run: |
           # Get image digest for attestations
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears:${{ github.sha }} | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears:${{ github.sha }})")
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }})")
           
           echo "IMAGE_DIGEST=$DIGEST" > image-digest.txt
           echo "image_digest=$DIGEST" >> $GITHUB_OUTPUT
@@ -258,10 +295,10 @@ jobs:
           source image-digest.txt
           
           # Generate SBOM and scan image (all in one command)
-          trivy image --format cyclonedx --output sbom-with-vulns.cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears:${{ github.sha }}
+          trivy image --format cyclonedx --output sbom-with-vulns.cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
           
           # Also generate JSON format scan results for policy evaluation
-          trivy image --format json --output trivy-scan.json ghcr.io/${{ github.repository_owner }}/biogears:${{ github.sha }}
+          trivy image --format json --output trivy-scan.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
       
       - name: Upload SBOM and scan results
         uses: actions/upload-artifact@v4
@@ -617,7 +654,7 @@ jobs:
           # Create image metadata file for in-toto attestations
           cat > image-data.json << EOF
           {
-            "image_name": "biogears",
+            "image_name": "biogears-hari",
             "image_digest": "${IMAGE_DIGEST}"
           }
           EOF
@@ -750,7 +787,7 @@ jobs:
       
       - name: Publish artifacts to registry
         run: |
-          REPOSITORY="ghcr.io/${{ github.repository_owner }}/biogears-artifacts"
+          REPOSITORY="ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts"
           
           # Define media types
           SBOM_TYPE="application/vnd.cyclonedx+json"
@@ -773,7 +810,7 @@ jobs:
       
       - name: Verify artifact publishing
         run: |
-          REPOSITORY="ghcr.io/${{ github.repository_owner }}/biogears-artifacts"
+          REPOSITORY="ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts"
           
           echo "Listing published artifacts:"
           oras discover -o tree "${REPOSITORY}:sbom-${VERSION}" || echo "Could not list SBOM"
@@ -794,17 +831,17 @@ jobs:
           ## Artifacts
           
           ### Docker Image
-          - ghcr.io/${{ github.repository_owner }}/biogears:${{ github.sha }}
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
           
           ### Pipeline Artifacts (ORAS)
-          - ghcr.io/${{ github.repository_owner }}/biogears-artifacts:sbom-${VERSION}
-          - ghcr.io/${{ github.repository_owner }}/biogears-artifacts:attestations-${VERSION}
-          - ghcr.io/${{ github.repository_owner }}/biogears-artifacts:signatures-${VERSION}
-          - ghcr.io/${{ github.repository_owner }}/biogears-artifacts:policies-${VERSION}
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:sbom-${VERSION}
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:attestations-${VERSION}
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:signatures-${VERSION}
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:policies-${VERSION}
           
           ## View in GitHub Container Registry
-          - https://github.com/${{ github.repository_owner }}/biogears/pkgs/container/biogears
-          - https://github.com/${{ github.repository_owner }}/biogears-artifacts/pkgs/container/biogears-artifacts
+          - https://github.com/${{ github.repository_owner }}/biogears-hari/pkgs/container/biogears-hari
+          - https://github.com/${{ github.repository_owner }}/biogears-hari-artifacts/pkgs/container/biogears-hari-artifacts
           EOF
       
       - name: Upload pipeline report
