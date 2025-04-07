@@ -1,4 +1,4 @@
-name: Test Registry Artifacts
+name: Complete Registry Pipeline Test
 
 on:
   # Run when code is pushed to the haritest branch
@@ -13,8 +13,586 @@ permissions:
   packages: write
 
 jobs:
-  generate-and-publish:
-    name: Generate & Publish Test Artifacts
+  build-docker:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    outputs:
+      external_digest: ${{ steps.image_digests.outputs.external_digest }}
+      builder_digest: ${{ steps.image_digests.outputs.builder_digest }}
+      webgen_digest: ${{ steps.image_digests.outputs.webgen_digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build External Image
+        uses: docker/build-push-action@v4
+        with:
+          context: docker/external
+          file: docker/external/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/biogears-external:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Run Docker Compose to Build Other Images
+        run: |
+          # Modify docker-compose.yml to use the GitHub Container Registry images
+          sed -i 's/image: biogears-builder/image: ghcr.io\/${{ github.repository_owner }}\/biogears-builder:test/g' docker-compose.yml
+          sed -i 's/image: biogears-webgen/image: ghcr.io\/${{ github.repository_owner }}\/biogears-webgen:test/g' docker-compose.yml
+          sed -i 's/image: biogears-external/image: ghcr.io\/${{ github.repository_owner }}\/biogears-external:test/g' docker-compose.yml
+          
+          # Build the images
+          docker-compose build biogears-builder
+          docker-compose build biogears-webgen
+          
+          # Push the images
+          docker-compose push biogears-builder
+          docker-compose push biogears-webgen
+      
+      - name: Get Image Digests
+        id: image_digests
+        run: |
+          # Get image digests for attestations
+          EXTERNAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-external:test | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-external:test)")
+          BUILDER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-builder:test | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-builder:test)")
+          WEBGEN_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-webgen:test | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-webgen:test)")
+          
+          echo "EXTERNAL_DIGEST=$EXTERNAL_DIGEST" > image-digests.txt
+          echo "BUILDER_DIGEST=$BUILDER_DIGEST" >> image-digests.txt
+          echo "WEBGEN_DIGEST=$WEBGEN_DIGEST" >> image-digests.txt
+          
+          echo "external_digest=$EXTERNAL_DIGEST" >> $GITHUB_OUTPUT
+          echo "builder_digest=$BUILDER_DIGEST" >> $GITHUB_OUTPUT
+          echo "webgen_digest=$WEBGEN_DIGEST" >> $GITHUB_OUTPUT
+      
+      - name: Upload Image Digests
+        uses: actions/upload-artifact@v3
+        with:
+          name: image-digests
+          path: image-digests.txt
+
+  security-scan:
+    name: Security Scanning
+    needs: build-docker
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Install Trivy
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+      
+      - name: Scan Images with Trivy
+        run: |
+          # Scan external image
+          trivy image --format json --output trivy-external.json ghcr.io/${{ github.repository_owner }}/biogears-external:test
+          
+          # Scan builder image
+          trivy image --format json --output trivy-builder.json ghcr.io/${{ github.repository_owner }}/biogears-builder:test
+          
+          # Scan webgen image
+          trivy image --format json --output trivy-webgen.json ghcr.io/${{ github.repository_owner }}/biogears-webgen:test
+      
+      - name: Upload Scan Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: trivy-scans
+          path: trivy-*.json
+
+  generate-sboms:
+    name: Generate SBOMs
+    needs: [build-docker, security-scan]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Download Scan Results
+        uses: actions/download-artifact@v3
+        with:
+          name: trivy-scans
+      
+      - name: Install Syft and CycloneDX
+        run: |
+          # Install Syft for SBOM generation
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          
+          # Install CycloneDX CLI
+          wget https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.24.0/cyclonedx-linux-x64 -O /usr/local/bin/cyclonedx
+          chmod +x /usr/local/bin/cyclonedx
+      
+      - name: Generate SBOMs
+        run: |
+          # Generate SBOMs with Syft
+          syft ghcr.io/${{ github.repository_owner }}/biogears-external:test -o cyclonedx-json=sbom-external.cyclonedx.json
+          syft ghcr.io/${{ github.repository_owner }}/biogears-builder:test -o cyclonedx-json=sbom-builder.cyclonedx.json
+          syft ghcr.io/${{ github.repository_owner }}/biogears-webgen:test -o cyclonedx-json=sbom-webgen.cyclonedx.json
+          
+          # Merge vulnerabilities into SBOMs
+          cyclonedx merge --input-files sbom-external.cyclonedx.json trivy-external.json --output-file sbom-external-with-vulns.cyclonedx.json
+          cyclonedx merge --input-files sbom-builder.cyclonedx.json trivy-builder.json --output-file sbom-builder-with-vulns.cyclonedx.json
+          cyclonedx merge --input-files sbom-webgen.cyclonedx.json trivy-webgen.json --output-file sbom-webgen-with-vulns.cyclonedx.json
+      
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom-files
+          path: sbom-*-with-vulns.cyclonedx.json
+
+  create-policies:
+    name: Create Validation Policies
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Create Policy Files
+        run: |
+          mkdir -p policies/rego
+          
+          # Create SBOM policy
+          cat > policies/rego/sbom_policy.rego << 'EOF'
+          package sbom
+
+          # SBOM must be in CycloneDX format
+          valid_format {
+              input.bomFormat == "CycloneDX"
+          }
+
+          # SBOM must have a version specified
+          has_version {
+              input.specVersion != null
+              input.specVersion != ""
+          }
+
+          # SBOM must have components
+          has_components {
+              count(input.components) > 0
+          }
+
+          # Verify SBOM has metadata
+          has_metadata {
+              input.metadata != null
+          }
+
+          # Check if there are any critical vulnerabilities
+          has_critical_vulnerabilities {
+              some component, vulnerability
+              input.components[component].vulnerabilities[vulnerability].severity == "critical"
+          }
+
+          # Deny if there are critical vulnerabilities
+          deny[msg] {
+              has_critical_vulnerabilities
+              msg := "SBOM contains components with critical vulnerabilities"
+          }
+
+          # SBOM is valid if it passes all validation checks
+          valid {
+              valid_format
+              has_version
+              has_components
+              has_metadata
+          }
+
+          # Generate an attestation statement
+          attestation[result] {
+              result := {
+                  "valid": valid,
+                  "format": input.bomFormat,
+                  "components_count": count(input.components),
+                  "timestamp": time.now_ns()
+              }
+          }
+          EOF
+
+          # Create container scan policy
+          cat > policies/rego/container_scan_policy.rego << 'EOF'
+          package container_scan
+
+          # Maximum allowed counts for different vulnerability severities
+          max_critical = 0
+          max_high = 5
+          max_medium = 20
+
+          # Count vulnerabilities by severity
+          critical_count = count {
+              count = count([v | v = input.Results[_].Vulnerabilities[_]; v.Severity == "CRITICAL"])
+          }
+
+          high_count = count {
+              count = count([v | v = input.Results[_].Vulnerabilities[_]; v.Severity == "HIGH"])
+          }
+
+          medium_count = count {
+              count = count([v | v = input.Results[_].Vulnerabilities[_]; v.Severity == "MEDIUM"])
+          }
+
+          # Vulnerability policy violations
+          violations[msg] {
+              critical_count > max_critical
+              msg := sprintf("Critical vulnerabilities found: %d (maximum allowed: %d)", [critical_count, max_critical])
+          }
+
+          violations[msg] {
+              high_count > max_high
+              msg := sprintf("High vulnerabilities found: %d (maximum allowed: %d)", [high_count, max_high])
+          }
+
+          violations[msg] {
+              medium_count > max_medium
+              msg := sprintf("Medium vulnerabilities found: %d (maximum allowed: %d)", [medium_count, max_medium])
+          }
+
+          # Image scan is compliant if there are no violations
+          compliant {
+              count(violations) == 0
+          }
+
+          # Generate an attestation statement
+          attestation[result] {
+              result := {
+                  "compliant": compliant,
+                  "critical_vulnerabilities": critical_count,
+                  "high_vulnerabilities": high_count, 
+                  "medium_vulnerabilities": medium_count,
+                  "timestamp": time.now_ns()
+              }
+          }
+          EOF
+
+          # Create build attestation policy
+          cat > policies/rego/build_attestation_policy.rego << 'EOF'
+          package build_attestation
+
+          # Required build metadata fields
+          required_fields = {
+              "builder_id",
+              "build_type",
+              "source_repo",
+              "commit_hash",
+              "build_timestamp",
+              "build_platform"
+          }
+
+          # Check if all required fields are present
+          has_required_fields {
+              field := required_fields[_]
+              input[field]
+          }
+
+          missing_fields[field] {
+              field := required_fields[_]
+              not input[field]
+          }
+
+          # Verify the build type is allowed
+          allowed_build_types = {"Release", "Debug"}
+
+          has_valid_build_type {
+              input.build_type == allowed_build_types[_]
+          }
+
+          # Verify the build platform is allowed
+          allowed_platforms = {"linux", "macos", "windows"}
+
+          has_valid_platform {
+              input.build_platform == allowed_platforms[_]
+          }
+
+          # Deny reasons
+          deny[msg] {
+              count(missing_fields) > 0
+              msg := sprintf("Missing required build metadata fields: %v", [missing_fields])
+          }
+
+          deny[msg] {
+              not has_valid_build_type
+              msg := sprintf("Invalid build type: %s. Allowed types: %v", [input.build_type, allowed_build_types])
+          }
+
+          deny[msg] {
+              not has_valid_platform
+              msg := sprintf("Invalid build platform: %s. Allowed platforms: %v", [input.build_platform, allowed_platforms])
+          }
+
+          # Build attestation is valid if there are no violations
+          valid {
+              count(deny) == 0
+          }
+
+          # Generate an attestation statement
+          attestation[result] {
+              result := {
+                  "valid": valid,
+                  "builder_id": input.builder_id,
+                  "build_type": input.build_type,
+                  "source_repo": input.source_repo,
+                  "commit_hash": input.commit_hash,
+                  "build_timestamp": input.build_timestamp,
+                  "build_platform": input.build_platform,
+                  "timestamp": time.now_ns()
+              }
+          }
+          EOF
+          
+          # Create in-toto attestation converter
+          cat > policies/rego/intoto_attestation.rego << 'EOF'
+          package intoto
+
+          # Convert custom attestation to in-toto format
+          to_intoto_format(data, subject_name, subject_digest, predicate_type) = intoto_statement {
+              intoto_statement := {
+                  "_type": "https://in-toto.io/Statement/v0.1",
+                  "subject": [{
+                      "name": subject_name,
+                      "digest": subject_digest
+                  }],
+                  "predicateType": predicate_type,
+                  "predicate": data
+              }
+          }
+
+          # Generate in-toto build attestation
+          build_attestation[statement] {
+              # First get regular build attestation data
+              attestation := data.build_attestation.attestation[_]
+              
+              # Convert to in-toto format
+              statement := to_intoto_format(
+                  attestation,
+                  sprintf("build-%s", [attestation.build_platform]),
+                  {"sha256": attestation.commit_hash},
+                  "https://example.org/attestations/build/v1"
+              )
+          }
+
+          # Generate in-toto container scan attestation
+          container_scan_attestation[statement] {
+              # Get container scan attestation data
+              scan := data.container_scan.attestation[_]
+              
+              # Convert to in-toto format
+              statement := to_intoto_format(
+                  scan,
+                  sprintf("container-scan-%s", [input.image_name]),
+                  {"sha256": input.image_digest},
+                  "https://example.org/attestations/container-scan/v1"
+              )
+          }
+
+          # Generate in-toto SBOM attestation
+          sbom_attestation[statement] {
+              # Get SBOM attestation data
+              sbom := data.sbom.attestation[_]
+              
+              # Convert to in-toto format
+              statement := to_intoto_format(
+                  sbom,
+                  sprintf("sbom-%s", [input.image_name]),
+                  {"sha256": input.image_digest},
+                  "https://in-toto.io/attestation/sbom/v1"
+              )
+          }
+          EOF
+      
+      - name: Install Cosign
+        run: |
+          wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+      
+      - name: Generate Signing Keys and Sign Policies
+        run: |
+          # Generate key pair
+          cosign generate-key-pair
+          
+          # Sign all policy files
+          for policy_file in policies/rego/*.rego; do
+            cosign sign-blob --key cosign.key "$policy_file" > "$policy_file.sig"
+          done
+          
+          # Create a tar archive of all policies and signatures
+          tar -czvf signed-policies.tar.gz policies/
+      
+      - name: Upload Policies
+        uses: actions/upload-artifact@v3
+        with:
+          name: signed-policies
+          path: |
+            signed-policies.tar.gz
+            cosign.*
+
+  generate-attestations:
+    name: Generate Attestations
+    needs: [build-docker, security-scan, generate-sboms, create-policies]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download Artifacts
+        uses: actions/download-artifact@v3
+      
+      - name: Install OPA and Cosign
+        run: |
+          # Install OPA
+          curl -L -o opa https://github.com/open-policy-agent/opa/releases/latest/download/opa_linux_amd64
+          chmod 755 opa
+          sudo mv opa /usr/local/bin/opa
+          
+          # Install Cosign
+          wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+      
+      - name: Extract Artifacts
+        run: |
+          # Extract policies
+          mkdir -p temp-policies
+          tar -xf signed-policies/signed-policies.tar.gz -C temp-policies
+          cp -r temp-policies/policies .
+          
+          # Create image metadata files
+          cat image-digests/image-digests.txt
+          source image-digests/image-digests.txt
+          
+          # Create image metadata files for in-toto attestations
+          cat > external-image-data.json << EOF
+          {
+            "image_name": "biogears-external",
+            "image_digest": "${EXTERNAL_DIGEST}"
+          }
+          EOF
+          
+          cat > builder-image-data.json << EOF
+          {
+            "image_name": "biogears-builder",
+            "image_digest": "${BUILDER_DIGEST}"
+          }
+          EOF
+          
+          cat > webgen-image-data.json << EOF
+          {
+            "image_name": "biogears-webgen",
+            "image_digest": "${WEBGEN_DIGEST}"
+          }
+          EOF
+          
+          # Create build metadata
+          cat > build-metadata.json << EOF
+          {
+            "builder_id": "github-actions",
+            "build_type": "Release",
+            "source_repo": "${{ github.server_url }}/${{ github.repository }}",
+            "commit_hash": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "build_platform": "linux"
+          }
+          EOF
+      
+      - name: Generate Attestations
+        run: |
+          # Generate Regular Attestations
+          opa eval -i build-metadata.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.attestation" -f json > build-attestation-raw.json
+          
+          opa eval -i trivy-scans/trivy-external.json -d policies/rego/container_scan_policy.rego "data.container_scan.attestation" -f json > container-scan-external-raw.json
+          opa eval -i trivy-scans/trivy-builder.json -d policies/rego/container_scan_policy.rego "data.container_scan.attestation" -f json > container-scan-builder-raw.json
+          opa eval -i trivy-scans/trivy-webgen.json -d policies/rego/container_scan_policy.rego "data.container_scan.attestation" -f json > container-scan-webgen-raw.json
+          
+          opa eval -i sbom-files/sbom-external-with-vulns.cyclonedx.json -d policies/rego/sbom_policy.rego "data.sbom.attestation" -f json > sbom-external-raw.json
+          opa eval -i sbom-files/sbom-builder-with-vulns.cyclonedx.json -d policies/rego/sbom_policy.rego "data.sbom.attestation" -f json > sbom-builder-raw.json
+          opa eval -i sbom-files/sbom-webgen-with-vulns.cyclonedx.json -d policies/rego/sbom_policy.rego "data.sbom.attestation" -f json > sbom-webgen-raw.json
+          
+          # Generate in-toto Attestations
+          opa eval --data-file build-attestation-raw.json --data policies/rego/intoto_attestation.rego "data.intoto.build_attestation[_]" -f json > build-intoto-attestation.json
+          
+          opa eval --data-file container-scan-external-raw.json --data policies/rego/intoto_attestation.rego -i external-image-data.json "data.intoto.container_scan_attestation[_]" -f json > container-scan-intoto-external.json
+          opa eval --data-file container-scan-builder-raw.json --data policies/rego/intoto_attestation.rego -i builder-image-data.json "data.intoto.container_scan_attestation[_]" -f json > container-scan-intoto-builder.json
+          opa eval --data-file container-scan-webgen-raw.json --data policies/rego/intoto_attestation.rego -i webgen-image-data.json "data.intoto.container_scan_attestation[_]" -f json > container-scan-intoto-webgen.json
+          
+          opa eval --data-file sbom-external-raw.json --data policies/rego/intoto_attestation.rego -i external-image-data.json "data.intoto.sbom_attestation[_]" -f json > sbom-intoto-external.json
+          opa eval --data-file sbom-builder-raw.json --data policies/rego/intoto_attestation.rego -i builder-image-data.json "data.intoto.sbom_attestation[_]" -f json > sbom-intoto-builder.json
+          opa eval --data-file sbom-webgen-raw.json --data policies/rego/intoto_attestation.rego -i webgen-image-data.json "data.intoto.sbom_attestation[_]" -f json > sbom-intoto-webgen.json
+      
+      - name: Sign Attestations
+        run: |
+          # Copy signing keys
+          cp signed-policies/cosign.* ./
+          
+          # Sign the raw attestations
+          for file in *-raw.json; do
+            cosign sign-blob --key cosign.key "$file" > "$file.sig"
+          done
+          
+          # Sign the in-toto attestations
+          for file in *-intoto-*.json; do
+            cosign attest --key cosign.key --type custom < "$file" > "$file.signed" || echo "Signing failed"
+            cosign sign-blob --key cosign.key "$file" > "$file.sig"
+          done
+          
+          # Package all signatures
+          mkdir -p all-signatures
+          cp *.sig all-signatures/
+          cp *.signed all-signatures/ || true
+          tar -czvf all-signatures.tar.gz all-signatures/
+      
+      - name: Upload Attestations
+        uses: actions/upload-artifact@v3
+        with:
+          name: intoto-attestations
+          path: '*-intoto-*.json*'
+      
+      - name: Upload Raw Attestations
+        uses: actions/upload-artifact@v3
+        with:
+          name: regular-attestations
+          path: '*-raw.json*'
+      
+      - name: Upload Signatures
+        uses: actions/upload-artifact@v3
+        with:
+          name: all-signatures
+          path: 'all-signatures.tar.gz'
+
+  publish-artifacts:
+    name: Publish Artifacts to Registry
+    needs: [build-docker, security-scan, generate-sboms, create-policies, generate-attestations]
     runs-on: ubuntu-latest
     
     steps:
@@ -22,15 +600,23 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-          
+      
       - name: Set Version Information
         run: |
-          # Generate a unique version using branch name and run ID
-          BRANCH_NAME=${GITHUB_REF#refs/heads/}
-          VERSION="${BRANCH_NAME}-${GITHUB_RUN_ID}"
+          # Use Git tags if available, otherwise fallback to commit SHA and date
+          GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo "")
+          if [ -n "$GIT_TAG" ]; then
+            VERSION="${GIT_TAG}"
+          else
+            SHORT_SHA="${{ github.sha }}"
+            VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
+          fi
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "Using version: $VERSION"
-          
+      
+      - name: Download Artifacts
+        uses: actions/download-artifact@v3
+      
       - name: Install Required Tools
         run: |
           # Install ORAS
@@ -49,144 +635,77 @@ jobs:
           chmod +x cosign-linux-amd64
           sudo mv cosign-linux-amd64 /usr/local/bin/cosign
       
-      - name: Generate Test Artifacts
-        run: |
-          # Create directory structure
-          mkdir -p artifacts/{sboms,attestations,signatures,policies,archives}
-          
-          # Generate sample SBOM
-          cat > artifacts/sboms/sbom-external-with-vulns.cyclonedx.json << EOF
-          {
-            "bomFormat": "CycloneDX",
-            "specVersion": "1.4",
-            "serialNumber": "urn:uuid:$(cat /proc/sys/kernel/random/uuid)",
-            "version": 1,
-            "metadata": {
-              "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-              "tools": [
-                {
-                  "vendor": "BioGears",
-                  "name": "TestTool",
-                  "version": "1.0.0"
-                }
-              ]
-            },
-            "components": [
-              {
-                "type": "library",
-                "name": "test-component",
-                "version": "1.0.0"
-              }
-            ]
-          }
-          EOF
-          
-          # Also create SBOM for builder and webgen
-          cp artifacts/sboms/sbom-external-with-vulns.cyclonedx.json artifacts/sboms/sbom-builder-with-vulns.cyclonedx.json
-          cp artifacts/sboms/sbom-external-with-vulns.cyclonedx.json artifacts/sboms/sbom-webgen-with-vulns.cyclonedx.json
-          
-          # Create sample attestation
-          cat > artifacts/attestations/build-intoto-attestation.json << EOF
-          {
-            "_type": "https://in-toto.io/Statement/v0.1",
-            "subject": [{
-              "name": "test-build",
-              "digest": {"sha256": "$(echo -n "testdata" | sha256sum | cut -d' ' -f1)"}
-            }],
-            "predicateType": "https://example.org/attestations/build/v1",
-            "predicate": {
-              "builder_id": "github-actions",
-              "build_type": "Release",
-              "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-              "build_platform": "ubuntu-latest"
-            }
-          }
-          EOF
-          
-          # Create container scan attestation
-          cat > artifacts/attestations/container-scan-intoto-external.json << EOF
-          {
-            "_type": "https://in-toto.io/Statement/v0.1",
-            "subject": [{
-              "name": "container-scan-external",
-              "digest": {"sha256": "$(echo -n "external-container" | sha256sum | cut -d' ' -f1)"}
-            }],
-            "predicateType": "https://example.org/attestations/container-scan/v1",
-            "predicate": {
-              "compliant": true,
-              "critical_vulnerabilities": 0,
-              "high_vulnerabilities": 2,
-              "medium_vulnerabilities": 5,
-              "timestamp": $(date +%s)000000000
-            }
-          }
-          EOF
-          
-          # Create a test policy
-          mkdir -p artifacts/policies/rego
-          cat > artifacts/policies/rego/test-policy.rego << EOF
-          package test
-          
-          default allow = false
-          
-          allow {
-            input.action == "test"
-          }
-          EOF
-          
-          cat > artifacts/policies/rego/sbom_policy.rego << EOF
-          package sbom
-          
-          # SBOM must be in CycloneDX format
-          valid_format {
-              input.bomFormat == "CycloneDX"
-          }
-          
-          # SBOM must have a version specified
-          has_version {
-              input.specVersion != null
-              input.specVersion != ""
-          }
-          
-          # SBOM must have components
-          has_components {
-              count(input.components) > 0
-          }
-          
-          # SBOM is valid if it passes all validation checks
-          valid {
-              valid_format
-              has_version
-              has_components
-          }
-          EOF
-          
-          # Create signature files
-          echo "test signature" > artifacts/signatures/sbom-external.sig
-          echo "test signature" > artifacts/signatures/attestation.sig
-          
-          # Create archives
-          tar -czf artifacts/archives/signatures.tar.gz -C artifacts/signatures . || echo "No signatures to archive"
-          tar -czf artifacts/archives/policies.tar.gz -C artifacts/policies . || echo "No policies to archive"
-          
-          echo "Test artifacts generated successfully"
-          
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Push Artifacts to GitHub Container Registry
+      
+      - name: Prepare Artifacts Directory
+        run: |
+          mkdir -p artifacts/{sboms,attestations,signatures,policies,archives}
+          
+          # Copy SBOMs
+          cp sbom-files/sbom-*-with-vulns.cyclonedx.json artifacts/sboms/
+          
+          # Copy attestations
+          cp intoto-attestations/*-intoto-*.json artifacts/attestations/
+          cp regular-attestations/*-raw.json artifacts/attestations/
+          
+          # Extract signatures
+          mkdir -p temp-signatures
+          tar -xf all-signatures/all-signatures.tar.gz -C temp-signatures
+          cp -r temp-signatures/all-signatures/* artifacts/signatures/
+          
+          # Extract policies
+          mkdir -p temp-policies
+          tar -xf signed-policies/signed-policies.tar.gz -C temp-policies
+          cp -r temp-policies/policies/* artifacts/policies/
+          
+          # Create archives for pushing
+          tar -czf artifacts/archives/signatures.tar.gz -C artifacts/signatures . || echo "No signatures to archive"
+          tar -czf artifacts/archives/policies.tar.gz -C artifacts/policies . || echo "No policies to archive"
+          ls -la artifacts/archives/
+      
+      - name: Calculate Artifact Sizes
+        run: |
+          # Create a function to safely calculate file size
+          calculate_size() {
+            local file=$1
+            if [ -f "$file" ]; then
+              stat -c%s "$file"
+            else
+              echo "0"
+            fi
+          }
+          
+          # Calculate SBOM sizes
+          for sbom in artifacts/sboms/sbom-*-with-vulns.cyclonedx.json; do
+            if [ -f "$sbom" ]; then
+              name=$(basename $sbom | sed 's/sbom-\(.*\)-with-vulns.cyclonedx.json/\1/')
+              name_upper=$(echo $name | tr '[:lower:]' '[:upper:]')
+              size=$(calculate_size "$sbom")
+              echo "${name_upper}_SBOM_SIZE=$size" >> $GITHUB_ENV
+              echo "Size of $name SBOM: $size bytes"
+            fi
+          done
+          
+          # Calculate other artifact sizes
+          SIGNATURES_SIZE=$(calculate_size "artifacts/archives/signatures.tar.gz")
+          POLICIES_SIZE=$(calculate_size "artifacts/archives/policies.tar.gz")
+          echo "SIGNATURES_SIZE=$SIGNATURES_SIZE" >> $GITHUB_ENV
+          echo "POLICIES_SIZE=$POLICIES_SIZE" >> $GITHUB_ENV
+          echo "Signatures size: $SIGNATURES_SIZE bytes"
+          echo "Policies size: $POLICIES_SIZE bytes"
+      
+      - name: Push Artifacts to Registry
         run: |
           # Define standard media types
           SBOM_TYPE="application/vnd.cyclonedx+json"
           ATTESTATION_TYPE="application/in-toto+json"
           SIG_TYPE="application/vnd.sigstore+tar+gzip"
           POLICY_TYPE="application/vnd.rego+tar+gzip"
-          
-          REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
           
           push_with_retry() {
             local repo=$1
@@ -213,6 +732,8 @@ jobs:
               fi
             done
           }
+          
+          REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
           
           # Push SBOMs
           for sbom in artifacts/sboms/sbom-*-with-vulns.cyclonedx.json; do
@@ -245,41 +766,29 @@ jobs:
             push_with_retry "${REPOSITORY}/policies" "${VERSION}" \
               artifacts/archives/policies.tar.gz "$POLICY_TYPE" || echo "Failed to push policies bundle"
           fi
-          
-      - name: Calculate Artifact Sizes
+      
+      - name: Get SBOMs Digests
+        id: sbom_digests
         run: |
-          # Create a function to safely calculate file size
-          calculate_size() {
-            local file=$1
-            if [ -f "$file" ]; then
-              stat -c%s "$file"
-            else
-              echo "0"
-            fi
-          }
+          REPOSITORY="${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
+          SBOM_EXTERNAL_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/sbom:external-${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest')
+          SBOM_BUILDER_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/sbom:builder-${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest')
+          SBOM_WEBGEN_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/sbom:webgen-${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest')
+          SIGNATURES_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/signatures:${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest')
+          POLICIES_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/policies:${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest')
           
-          # Calculate SBOM sizes
-          for sbom in artifacts/sboms/sbom-*-with-vulns.cyclonedx.json; do
-            if [ -f "$sbom" ]; then
-              name=$(basename $sbom | sed 's/sbom-\(.*\)-with-vulns.cyclonedx.json/\1/')
-              name_upper=$(echo $name | tr '[:lower:]' '[:upper:]')
-              size=$(calculate_size "$sbom")
-              echo "${name_upper}_SBOM_SIZE=$size" >> $GITHUB_ENV
-              echo "Size of $name SBOM: $size bytes"
-            fi
-          done
-          
-          # Calculate other artifact sizes
-          SIGNATURES_SIZE=$(calculate_size "artifacts/archives/signatures.tar.gz")
-          POLICIES_SIZE=$(calculate_size "artifacts/archives/policies.tar.gz")
-          echo "SIGNATURES_SIZE=$SIGNATURES_SIZE" >> $GITHUB_ENV
-          echo "POLICIES_SIZE=$POLICIES_SIZE" >> $GITHUB_ENV
-          echo "Signatures size: $SIGNATURES_SIZE bytes"
-          echo "Policies size: $POLICIES_SIZE bytes"
-          
+          echo "SBOM_EXTERNAL_DIGEST=$SBOM_EXTERNAL_DIGEST" >> $GITHUB_ENV
+          echo "SBOM_BUILDER_DIGEST=$SBOM_BUILDER_DIGEST" >> $GITHUB_ENV
+          echo "SBOM_WEBGEN_DIGEST=$SBOM_WEBGEN_DIGEST" >> $GITHUB_ENV
+          echo "SIGNATURES_DIGEST=$SIGNATURES_DIGEST" >> $GITHUB_ENV
+          echo "POLICIES_DIGEST=$POLICIES_DIGEST" >> $GITHUB_ENV
+      
       - name: Create and Push Reference Manifest
         run: |
           REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
+          
+          # Load digests from image-digests.txt
+          source image-digests/image-digests.txt
           
           # Create reference manifest pointing to all published artifacts
           cat > reference-manifest.json << EOF
@@ -292,10 +801,15 @@ jobs:
               "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f6f3393a4c",
               "size": 2
             },
+            "subject": {
+              "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+              "digest": "${EXTERNAL_DIGEST}",
+              "size": 0
+            },
             "annotations": {
               "org.opencontainers.image.created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
               "org.opencontainers.image.version": "${VERSION}",
-              "org.opencontainers.image.title": "BioGears Test Release",
+              "org.opencontainers.image.title": "BioGears Full Pipeline Test",
               "org.opencontainers.image.vendor": "BioGears",
               "org.opencontainers.image.source": "${{ github.server_url }}/${{ github.repository }}",
               "org.opencontainers.image.revision": "${{ github.sha }}",
@@ -305,6 +819,7 @@ jobs:
             "layers": [
               {
                 "mediaType": "application/vnd.cyclonedx+json",
+                "digest": "${SBOM_EXTERNAL_DIGEST}",
                 "size": ${EXTERNAL_SBOM_SIZE:-0},
                 "annotations": {
                   "org.opencontainers.artifact.description": "External SBOM",
@@ -313,6 +828,7 @@ jobs:
               },
               {
                 "mediaType": "application/vnd.cyclonedx+json",
+                "digest": "${SBOM_BUILDER_DIGEST}",
                 "size": ${BUILDER_SBOM_SIZE:-0},
                 "annotations": {
                   "org.opencontainers.artifact.description": "Builder SBOM",
@@ -321,6 +837,7 @@ jobs:
               },
               {
                 "mediaType": "application/vnd.cyclonedx+json",
+                "digest": "${SBOM_WEBGEN_DIGEST}",
                 "size": ${WEBGEN_SBOM_SIZE:-0},
                 "annotations": {
                   "org.opencontainers.artifact.description": "Webgen SBOM",
@@ -329,6 +846,7 @@ jobs:
               },
               {
                 "mediaType": "application/vnd.sigstore+tar+gzip",
+                "digest": "${SIGNATURES_DIGEST}",
                 "size": ${SIGNATURES_SIZE:-0},
                 "annotations": {
                   "org.opencontainers.artifact.description": "Signatures Bundle",
@@ -337,6 +855,7 @@ jobs:
               },
               {
                 "mediaType": "application/vnd.rego+tar+gzip",
+                "digest": "${POLICIES_DIGEST}",
                 "size": ${POLICIES_SIZE:-0},
                 "annotations": {
                   "org.opencontainers.artifact.description": "Policies Bundle",
@@ -352,46 +871,62 @@ jobs:
             "${REPOSITORY}/release:${VERSION}" \
             --artifact-type "application/vnd.biogears.release" \
             --manifest reference-manifest.json
-
-      - name: Verify References
+      
+      - name: Verify Artifact Graph
         run: |
           REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
           
-          echo "Trying to discover artifact graph..."
+          echo "Verifying artifact graph..."
           oras discover -o tree "${REPOSITORY}/release:${VERSION}" || echo "Could not retrieve artifact graph"
-
+      
       - name: Generate Registry Report
         run: |
           REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
           
-          echo "# Test Artifacts Published" > test-report.md
-          echo "Generated: $(date -u)" >> test-report.md
-          echo "Version: ${VERSION}" >> test-report.md
-          echo "Branch: ${GITHUB_REF_NAME}" >> test-report.md
-          echo "Run ID: ${GITHUB_RUN_ID}" >> test-report.md
-          echo "" >> test-report.md
+          echo "# Complete Pipeline Test Results" > full-pipeline-report.md
+          echo "Generated: $(date -u)" >> full-pipeline-report.md
+          echo "Version: ${VERSION}" >> full-pipeline-report.md
+          echo "Branch: ${{ github.ref_name }}" >> full-pipeline-report.md
+          echo "Run ID: ${{ github.run_id }}" >> full-pipeline-report.md
+          echo "" >> full-pipeline-report.md
           
-          echo "## Published Artifacts" >> test-report.md
-          echo "" >> test-report.md
-          echo "- SBOMs:" >> test-report.md
-          echo "  - ${REPOSITORY}/sbom:external-${VERSION}" >> test-report.md
-          echo "  - ${REPOSITORY}/sbom:builder-${VERSION}" >> test-report.md
-          echo "  - ${REPOSITORY}/sbom:webgen-${VERSION}" >> test-report.md
-          echo "" >> test-report.md
-          echo "- Attestations:" >> test-report.md
-          echo "  - ${REPOSITORY}/attestation:build-${VERSION}" >> test-report.md
-          echo "  - ${REPOSITORY}/attestation:container-scan-${VERSION}" >> test-report.md
-          echo "" >> test-report.md
-          echo "- Signatures: ${REPOSITORY}/signatures:${VERSION}" >> test-report.md
-          echo "- Policies: ${REPOSITORY}/policies:${VERSION}" >> test-report.md
-          echo "- Reference Manifest: ${REPOSITORY}/release:${VERSION}" >> test-report.md
-          echo "" >> test-report.md
+          echo "## Docker Images" >> full-pipeline-report.md
+          echo "" >> full-pipeline-report.md
+          echo "- External: ghcr.io/${{ github.repository_owner }}/biogears-external:test" >> full-pipeline-report.md
+          echo "- Builder: ghcr.io/${{ github.repository_owner }}/biogears-builder:test" >> full-pipeline-report.md
+          echo "- Webgen: ghcr.io/${{ github.repository_owner }}/biogears-webgen:test" >> full-pipeline-report.md
+          echo "" >> full-pipeline-report.md
           
-          echo "## View in GitHub Container Registry" >> test-report.md
-          echo "https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}-test/pkgs/container/release" >> test-report.md
+          echo "## Published Artifacts" >> full-pipeline-report.md
+          echo "" >> full-pipeline-report.md
+          echo "### SBOMs" >> full-pipeline-report.md
+          echo "- ${REPOSITORY}/sbom:external-${VERSION}" >> full-pipeline-report.md
+          echo "- ${REPOSITORY}/sbom:builder-${VERSION}" >> full-pipeline-report.md
+          echo "- ${REPOSITORY}/sbom:webgen-${VERSION}" >> full-pipeline-report.md
+          echo "" >> full-pipeline-report.md
           
-      - name: Upload Test Report
+          echo "### Attestations" >> full-pipeline-report.md
+          echo "- ${REPOSITORY}/attestation:build-${VERSION}" >> full-pipeline-report.md
+          echo "- ${REPOSITORY}/attestation:container-scan-external-${VERSION}" >> full-pipeline-report.md
+          echo "- ${REPOSITORY}/attestation:container-scan-builder-${VERSION}" >> full-pipeline-report.md
+          echo "- ${REPOSITORY}/attestation:container-scan-webgen-${VERSION}" >> full-pipeline-report.md
+          echo "- ${REPOSITORY}/attestation:sbom-external-${VERSION}" >> full-pipeline-report.md
+          echo "- ${REPOSITORY}/attestation:sbom-builder-${VERSION}" >> full-pipeline-report.md
+          echo "- ${REPOSITORY}/attestation:sbom-webgen-${VERSION}" >> full-pipeline-report.md
+          echo "" >> full-pipeline-report.md
+          
+          echo "### Other Artifacts" >> full-pipeline-report.md
+          echo "- Signatures: ${REPOSITORY}/signatures:${VERSION}" >> full-pipeline-report.md
+          echo "- Policies: ${REPOSITORY}/policies:${VERSION}" >> full-pipeline-report.md
+          echo "- Reference: ${REPOSITORY}/release:${VERSION}" >> full-pipeline-report.md
+          echo "" >> full-pipeline-report.md
+          
+          echo "## View in GitHub Container Registry" >> full-pipeline-report.md
+          echo "- https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}-test/pkgs/container/release" >> full-pipeline-report.md
+          echo "- https://github.com/${{ github.repository_owner }}/biogears-external/pkgs/container/biogears-external" >> full-pipeline-report.md
+          
+      - name: Upload Full Pipeline Report
         uses: actions/upload-artifact@v3
         with:
-          name: test-registry-report
-          path: test-report.md 
+          name: full-pipeline-report
+          path: full-pipeline-report.md 
