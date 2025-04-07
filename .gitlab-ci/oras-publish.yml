@@ -1,0 +1,472 @@
+oras:publish:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - build:linux
+    - sbom:generate
+    - attestation:generate
+    - signature:verify
+  variables:
+    # Define standard media types
+    SBOM_TYPE: "application/vnd.cyclonedx+json"
+    ATTESTATION_TYPE: "application/in-toto+json"
+    SIG_TYPE: "application/vnd.sigstore+tar+gzip"
+    POLICY_TYPE: "application/vnd.rego+tar+gzip"
+    RELEASE_TYPE: "application/vnd.biogears.release"
+  before_script:
+    - apk add --no-cache bash curl wget tar jq git
+    # Install ORAS
+    - curl -LO https://github.com/oras-project/oras/releases/download/v1.2.2/oras_1.2.2_linux_amd64.tar.gz
+    - mkdir -p oras-install/
+    - tar -zxf oras_1.2.2_linux_amd64.tar.gz -C oras-install/
+    - mv oras-install/oras /usr/local/bin/
+    - oras version
+    
+    # Install cosign
+    - wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
+    - chmod +x cosign-linux-amd64
+    - mv cosign-linux-amd64 /usr/local/bin/cosign
+    
+    # Set up versioning
+    - |
+      # Use Git tags if available
+      GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo "")
+      if [ -n "$GIT_TAG" ]; then
+        VERSION="${GIT_TAG}"
+      else
+        # Use commit SHA and date
+        SHORT_SHA="${CI_COMMIT_SHA:0:8}"
+        VERSION="$(date +%Y%m%d)-${SHORT_SHA}"
+      fi
+      echo "Using version: $VERSION"
+  script:
+    # Login to the registry
+    - |
+      if [ "${OIDC_ENABLED}" == "true" ] && [ -n "${OIDC_TOKEN}" ]; then
+        echo "Using OIDC authentication"
+        oras login ${REGISTRY_URL} --username "oauth2accesstoken" --password "${OIDC_TOKEN}"
+      else
+        echo "${REGISTRY_PASSWORD}" | oras login ${REGISTRY_URL} --username ${REGISTRY_USERNAME} --password-stdin
+      fi
+    
+    # Prepare artifacts directory
+    - |
+      mkdir -p artifacts/{sboms,attestations,signatures,policies,archives}
+      
+      # Copy SBOMs
+      cp sbom-*-with-vulns.cyclonedx.json artifacts/sboms/ || echo "No SBOM files found"
+      
+      # Copy attestations
+      cp *-intoto-*.json artifacts/attestations/ || echo "No in-toto attestations found"
+      cp *-raw.json artifacts/attestations/ || echo "No raw attestations found"
+      
+      # Handle signatures
+      if [ -f "all-signatures.tar.gz" ]; then
+        mkdir -p temp-signatures
+        tar -xf all-signatures.tar.gz -C temp-signatures
+        cp -r temp-signatures/* artifacts/signatures/
+      else
+        mkdir -p artifacts/signatures
+        find . -name "*.sig" -exec cp {} artifacts/signatures/ \;
+      fi
+      
+      # Handle policies
+      if [ -f "signed-policies.tar.gz" ]; then
+        mkdir -p temp-policies
+        tar -xf signed-policies.tar.gz -C temp-policies
+        cp -r temp-policies/* artifacts/policies/
+      else
+        mkdir -p artifacts/policies
+        cp -r policies/rego/* artifacts/policies/ || echo "No policy files found"
+      fi
+      
+      # Create archives for pushing
+      tar -czf artifacts/archives/signatures.tar.gz -C artifacts/signatures . || echo "No signatures to archive"
+      tar -czf artifacts/archives/policies.tar.gz -C artifacts/policies . || echo "No policies to archive"
+      ls -la artifacts/archives/
+    
+    # Calculate artifact sizes
+    - |
+      # Create a function to safely calculate file size
+      calculate_size() {
+        local file=$1
+        if [ -f "$file" ]; then
+          stat -c%s "$file"
+        else
+          echo "0"
+        fi
+      }
+      
+      # Calculate SBOM sizes and store in environment variables
+      declare -A SBOM_SIZES
+      for sbom in artifacts/sboms/sbom-*-with-vulns.cyclonedx.json; do
+        if [ -f "$sbom" ]; then
+          name=$(basename $sbom | sed 's/sbom-\(.*\)-with-vulns.cyclonedx.json/\1/')
+          size=$(calculate_size "$sbom")
+          SBOM_SIZES[$name]=$size
+          echo "Size of $name SBOM: $size bytes"
+        fi
+      done
+      
+      # Calculate other artifact sizes
+      SIGNATURES_SIZE=$(calculate_size "artifacts/archives/signatures.tar.gz")
+      POLICIES_SIZE=$(calculate_size "artifacts/archives/policies.tar.gz")
+      echo "Signatures size: $SIGNATURES_SIZE bytes"
+      echo "Policies size: $POLICIES_SIZE bytes"
+    
+    # Define push function with retries
+    - |
+      push_with_retry() {
+        local repo=$1
+        local tag=$2
+        local file=$3
+        local type=$4
+        local attempt=1
+        local max_attempts=3
+        
+        while [ $attempt -le $max_attempts ]; do
+          echo "Attempt $attempt to push $file to $repo:$tag"
+          if oras push "${repo}:${tag}" --artifact-type "$type" "$file:$type"; then
+            echo "Successfully pushed $file to $repo:$tag"
+            return 0
+          fi
+          
+          attempt=$((attempt+1))
+          if [ $attempt -le $max_attempts ]; then
+            echo "Push failed, retrying in 5 seconds..."
+            sleep 5
+          else
+            echo "Push failed after $max_attempts attempts"
+            return 1
+          fi
+        done
+      }
+    
+    # Push artifacts
+    - |
+      REPOSITORY="${REGISTRY_URL}/${CI_PROJECT_PATH}"
+      
+      # Push SBOMs
+      for sbom in artifacts/sboms/sbom-*-with-vulns.cyclonedx.json; do
+        if [ -f "$sbom" ]; then
+          name=$(basename $sbom | sed 's/sbom-\(.*\)-with-vulns.cyclonedx.json/\1/')
+          echo "Pushing $name SBOM..."
+          push_with_retry "${REPOSITORY}/sbom" "${name}-$VERSION" "$sbom" "$SBOM_TYPE" || echo "Failed to push $name SBOM"
+        fi
+      done
+      
+      # Push attestations
+      for file in artifacts/attestations/*-intoto-*.json; do
+        if [ -f "$file" ]; then
+          name=$(basename $file | sed 's/-intoto-/-/' | sed 's/\.json//')
+          echo "Pushing attestation: $name..."
+          push_with_retry "${REPOSITORY}/attestation" "${name}-$VERSION" "$file" "$ATTESTATION_TYPE" || echo "Failed to push $name attestation"
+        fi
+      done
+      
+      # Push signatures bundle if it exists
+      if [ -f "artifacts/archives/signatures.tar.gz" ] && [ "$SIGNATURES_SIZE" -gt "0" ]; then
+        echo "Pushing signatures bundle..."
+        push_with_retry "${REPOSITORY}/signatures" "$VERSION" \
+          artifacts/archives/signatures.tar.gz "$SIG_TYPE" || echo "Failed to push signatures bundle"
+      fi
+      
+      # Push policies bundle if it exists
+      if [ -f "artifacts/archives/policies.tar.gz" ] && [ "$POLICIES_SIZE" -gt "0" ]; then
+        echo "Pushing policies bundle..."
+        push_with_retry "${REPOSITORY}/policies" "$VERSION" \
+          artifacts/archives/policies.tar.gz "$POLICY_TYPE" || echo "Failed to push policies bundle"
+      fi
+    
+    # Define digest fetching function with retries
+    - |
+      get_digest() {
+        local repo=$1
+        local tag=$2
+        local attempt=1
+        local max_attempts=3
+        
+        while [ $attempt -le $max_attempts ]; do
+          echo "Fetching digest for ${repo}:${tag}"
+          local result=$(oras discover -o json "${repo}:${tag}" 2>/dev/null || echo "{}")
+          if [ "$result" != "{}" ]; then
+            echo $result | jq -r '.manifests[0].digest'
+            return 0
+          fi
+          
+          attempt=$((attempt+1))
+          if [ $attempt -le $max_attempts ]; then
+            echo "Failed to get digest, retrying in 3 seconds..."
+            sleep 3
+          else
+            echo "Failed to get digest after $max_attempts attempts"
+            return 1
+          fi
+        done
+        
+        echo "sha256:unknown"
+      }
+    
+    # Create and push reference manifest
+    - |
+      REPOSITORY="${REGISTRY_URL}/${CI_PROJECT_PATH}"
+      
+      # Check if SBOMs exist and get their digests
+      if ls artifacts/sboms/sbom-*-with-vulns.cyclonedx.json 1> /dev/null 2>&1; then
+        SBOM_EXTERNAL_DIGEST=$(get_digest "${REPOSITORY}/sbom" "external-${VERSION}")
+        SBOM_BUILDER_DIGEST=$(get_digest "${REPOSITORY}/sbom" "builder-${VERSION}")
+        SBOM_WEBGEN_DIGEST=$(get_digest "${REPOSITORY}/sbom" "webgen-${VERSION}")
+      else
+        echo "No SBOM files found, using placeholder digests"
+        SBOM_EXTERNAL_DIGEST="sha256:unknown"
+        SBOM_BUILDER_DIGEST="sha256:unknown"
+        SBOM_WEBGEN_DIGEST="sha256:unknown"
+      fi
+      
+      # Get other artifact digests
+      if [ -f "artifacts/archives/signatures.tar.gz" ] && [ "$SIGNATURES_SIZE" -gt "0" ]; then
+        SIGNATURES_DIGEST=$(get_digest "${REPOSITORY}/signatures" "${VERSION}")
+      else
+        SIGNATURES_DIGEST="sha256:unknown"
+      fi
+      
+      if [ -f "artifacts/archives/policies.tar.gz" ] && [ "$POLICIES_SIZE" -gt "0" ]; then
+        POLICIES_DIGEST=$(get_digest "${REPOSITORY}/policies" "${VERSION}")
+      else
+        POLICIES_DIGEST="sha256:unknown"
+      fi
+      
+      # Create reference manifest template
+      cat > reference-manifest.json << EOF
+      {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "artifactType": "application/vnd.biogears.release",
+        "config": {
+          "mediaType": "application/vnd.oci.empty.v1+json",
+          "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f6f3393a4c",
+          "size": 2
+        },
+        "subject": {
+          "mediaType": "application/vnd.cyclonedx+json",
+          "digest": "${SBOM_EXTERNAL_DIGEST}",
+          "size": ${SBOM_SIZES[external]:-0}
+        },
+        "annotations": {
+          "org.opencontainers.image.created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+          "org.opencontainers.image.version": "${VERSION}",
+          "org.opencontainers.image.title": "BioGears Release Bundle",
+          "org.opencontainers.image.vendor": "BioGears",
+          "org.opencontainers.image.source": "${CI_PROJECT_URL}",
+          "org.opencontainers.image.revision": "${CI_COMMIT_SHA}",
+          "io.biogears.build.pipeline": "${CI_PIPELINE_ID}",
+          "io.biogears.build.job": "${CI_JOB_ID}"
+        },
+        "layers": [
+      EOF
+      
+      # Add layers conditionally
+      LAYERS=""
+      
+      # Add SBOM layers if they exist
+      if [ "$SBOM_EXTERNAL_DIGEST" != "sha256:unknown" ]; then
+        LAYERS="${LAYERS}    {
+            \"mediaType\": \"application/vnd.cyclonedx+json\",
+            \"digest\": \"${SBOM_EXTERNAL_DIGEST}\",
+            \"size\": ${SBOM_SIZES[external]:-0},
+            \"annotations\": {
+              \"org.opencontainers.artifact.description\": \"External SBOM\",
+              \"org.opencontainers.artifact.created\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+              \"org.opencontainers.image.title\": \"external-sbom\"
+            }
+          },"
+      fi
+      
+      if [ "$SBOM_BUILDER_DIGEST" != "sha256:unknown" ]; then
+        LAYERS="${LAYERS}    {
+            \"mediaType\": \"application/vnd.cyclonedx+json\",
+            \"digest\": \"${SBOM_BUILDER_DIGEST}\",
+            \"size\": ${SBOM_SIZES[builder]:-0},
+            \"annotations\": {
+              \"org.opencontainers.artifact.description\": \"Builder SBOM\",
+              \"org.opencontainers.artifact.created\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+              \"org.opencontainers.image.title\": \"builder-sbom\"
+            }
+          },"
+      fi
+      
+      if [ "$SBOM_WEBGEN_DIGEST" != "sha256:unknown" ]; then
+        LAYERS="${LAYERS}    {
+            \"mediaType\": \"application/vnd.cyclonedx+json\",
+            \"digest\": \"${SBOM_WEBGEN_DIGEST}\",
+            \"size\": ${SBOM_SIZES[webgen]:-0},
+            \"annotations\": {
+              \"org.opencontainers.artifact.description\": \"Webgen SBOM\",
+              \"org.opencontainers.artifact.created\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+              \"org.opencontainers.image.title\": \"webgen-sbom\"
+            }
+          },"
+      fi
+      
+      # Add signatures layer if it exists
+      if [ "$SIGNATURES_DIGEST" != "sha256:unknown" ]; then
+        LAYERS="${LAYERS}    {
+            \"mediaType\": \"application/vnd.sigstore+tar+gzip\",
+            \"digest\": \"${SIGNATURES_DIGEST}\",
+            \"size\": ${SIGNATURES_SIZE:-0},
+            \"annotations\": {
+              \"org.opencontainers.artifact.description\": \"Signatures Bundle\",
+              \"org.opencontainers.artifact.created\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+              \"org.opencontainers.image.title\": \"signatures-bundle\"
+            }
+          },"
+      fi
+      
+      # Add policies layer if it exists
+      if [ "$POLICIES_DIGEST" != "sha256:unknown" ]; then
+        LAYERS="${LAYERS}    {
+            \"mediaType\": \"application/vnd.rego+tar+gzip\",
+            \"digest\": \"${POLICIES_DIGEST}\",
+            \"size\": ${POLICIES_SIZE:-0},
+            \"annotations\": {
+              \"org.opencontainers.artifact.description\": \"Policies Bundle\",
+              \"org.opencontainers.artifact.created\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+              \"org.opencontainers.image.title\": \"policies-bundle\"
+            }
+          },"
+      fi
+      
+      # Remove trailing comma if needed
+      LAYERS=$(echo "$LAYERS" | sed 's/,$//')
+      
+      # Add layers to manifest
+      echo "$LAYERS" >> reference-manifest.json
+      
+      # Close the manifest
+      echo "      ]" >> reference-manifest.json
+      echo "    }" >> reference-manifest.json
+      
+      # Print the manifest for debugging
+      echo "Created reference manifest:"
+      cat reference-manifest.json
+      
+      # Push the reference manifest
+      echo "Pushing reference manifest..."
+      oras push \
+        "${REPOSITORY}/release:${VERSION}" \
+        --artifact-type "$RELEASE_TYPE" \
+        --manifest reference-manifest.json || echo "Failed to push reference manifest"
+    
+    # Verify references
+    - |
+      REPOSITORY="${REGISTRY_URL}/${CI_PROJECT_PATH}"
+      
+      echo "Verifying SBOM references..."
+      if ls artifacts/sboms/sbom-*-with-vulns.cyclonedx.json 1> /dev/null 2>&1; then
+        REFERRERS=$(oras discover -o json "${REPOSITORY}/sbom:external-${VERSION}" 2>/dev/null || echo "{}")
+        if [ "$REFERRERS" != "{}" ]; then
+          REFERRER_COUNT=$(echo $REFERRERS | jq '.manifests | length')
+          if [ "$REFERRER_COUNT" -eq 0 ]; then
+            echo "WARNING: No referrers found for SBOM, reference linking may have failed"
+          else
+            echo "Found $REFERRER_COUNT referrers for external SBOM"
+          fi
+        else
+          echo "WARNING: Could not fetch referrers for SBOM"
+        fi
+      else
+        echo "No SBOMs available for reference verification"
+      fi
+      
+      echo "Listing entire artifact graph..."
+      oras discover -o tree "${REPOSITORY}/release:${VERSION}" || echo "Could not retrieve artifact graph"
+    
+    # Create registry report
+    - |
+      # Create a report of all artifacts in the registry
+      REPOSITORY="${REGISTRY_URL}/${CI_PROJECT_PATH}"
+      
+      echo "# BioGears Artifact Registry Report" > registry-report.md
+      echo "Generated: $(date -u)" >> registry-report.md
+      echo "Version: ${VERSION}" >> registry-report.md
+      echo "Commit: ${CI_COMMIT_SHA}" >> registry-report.md
+      echo "Pipeline: ${CI_PIPELINE_ID}" >> registry-report.md
+      echo "" >> registry-report.md
+      
+      echo "## Repository Contents" >> registry-report.md
+      echo "" >> registry-report.md
+      
+      for REPO_TYPE in "sbom" "attestation" "signatures" "policies" "release"; do
+        echo "### ${REPO_TYPE^} Artifacts" >> registry-report.md
+        echo "" >> registry-report.md
+        echo "| Tag | Media Type | Digest | Created |" >> registry-report.md
+        echo "|-----|------------|--------|---------|" >> registry-report.md
+        
+        TAGS=$(oras repository tags "${REPOSITORY}/${REPO_TYPE}" 2>/dev/null || echo "")
+        
+        if [ -z "$TAGS" ]; then
+          echo "No tags found for ${REPO_TYPE}" >> registry-report.md
+        else
+          for TAG in $TAGS; do
+            INFO=$(oras discover -o json "${REPOSITORY}/${REPO_TYPE}:${TAG}" 2>/dev/null || echo "{}")
+            if [ "$INFO" != "{}" ]; then
+              MEDIA_TYPE=$(echo $INFO | jq -r '.manifests[0].mediaType')
+              DIGEST=$(echo $INFO | jq -r '.manifests[0].digest')
+              CREATED=$(echo $INFO | jq -r '.manifests[0].annotations["org.opencontainers.image.created"] // "N/A"')
+              echo "| ${TAG} | ${MEDIA_TYPE} | ${DIGEST} | ${CREATED} |" >> registry-report.md
+            else
+              echo "| ${TAG} | Error fetching info | | |" >> registry-report.md
+            fi
+          done
+        fi
+        
+        echo "" >> registry-report.md
+      done
+      
+      echo "## Reference Graph" >> registry-report.md
+      echo "" >> registry-report.md
+      echo '```' >> registry-report.md
+      oras discover -o tree "${REPOSITORY}/release:${VERSION}" >> registry-report.md 2>&1 || echo "Error generating reference graph" >> registry-report.md
+      echo '```' >> registry-report.md
+    
+    # Cleanup old artifacts (only on default branch)
+    - |
+      if [ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ] && [ "${CLEANUP_ENABLED}" == "true" ]; then
+        # Define retention period (90 days)
+        RETENTION_DAYS=90
+        CUTOFF_DATE=$(date -d "-${RETENTION_DAYS} days" +%Y%m%d || date -v "-${RETENTION_DAYS}d" +%Y%m%d || echo "")
+        
+        if [ -z "$CUTOFF_DATE" ]; then
+          echo "Could not calculate cutoff date, skipping cleanup"
+        else
+          echo "Cleaning up artifacts older than $CUTOFF_DATE"
+          REPOSITORY="${REGISTRY_URL}/${CI_PROJECT_PATH}"
+          
+          # List all tags and filter those older than retention period
+          for REPO_TYPE in "sbom" "attestation" "signatures" "policies" "release"; do
+            echo "Checking ${REPO_TYPE} artifacts..."
+            
+            # List tags for this repository
+            TAGS=$(oras repository tags "${REPOSITORY}/${REPO_TYPE}" 2>/dev/null || echo "")
+            
+            for TAG in $TAGS; do
+              # Extract date from tag (assuming format contains YYYYMMDD)
+              if [[ $TAG =~ ([0-9]{8}) ]]; then
+                TAG_DATE=${BASH_REMATCH[1]}
+                
+                # Check if this tag is older than cutoff
+                if [[ "$TAG_DATE" < "$CUTOFF_DATE" ]]; then
+                  echo "Deleting old artifact: ${REPOSITORY}/${REPO_TYPE}:${TAG}"
+                  oras repository delete --force "${REPOSITORY}/${REPO_TYPE}:${TAG}" || echo "Failed to delete tag"
+                fi
+              fi
+            done
+          done
+        fi
+      else
+        echo "Cleanup skipped - not on default branch or not enabled"
+      fi
+  artifacts:
+    paths:
+      - reference-manifest.json
+      - registry-report.md 

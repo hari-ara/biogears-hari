@@ -3,12 +3,15 @@ stages:
   - test
   - security
   - attestation
-  - verify
   - deploy
+  - verify
 
 variables:
   GIT_SUBMODULE_STRATEGY: recursive
   BUILD_TYPE: Release
+  REGISTRY_URL: ${CI_REGISTRY}
+  REGISTRY_USERNAME: ${CI_REGISTRY_USER}
+  REGISTRY_PASSWORD: ${CI_REGISTRY_PASSWORD}
 
 .build_template: &build_template
   stage: build
@@ -604,6 +607,10 @@ signature:verify:
   artifacts:
     paths:
       - verification-report.txt
+
+# Include ORAS publishing job
+include:
+  - local: .gitlab-ci/oras-publish.yml
 
 pages:
   stage: deploy
