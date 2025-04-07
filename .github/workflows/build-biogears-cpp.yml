@@ -1,0 +1,499 @@
+name: Build BioGears C++ Engine
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build BioGears on Linux
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential liblog4cpp5-dev libxerces-c-dev libeigen3-dev wget
+          # Install CodeSynthesis XSD
+          wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb
+          sudo dpkg -i xsd_4.0.0-1_amd64.deb
+      
+      - name: Configure CMake
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      
+      - name: Build BioGears
+        run: |
+          cd build
+          cmake --build . --parallel $(nproc)
+          
+      - name: Create build metadata
+        run: |
+          cat > build-metadata.json << EOF
+          {
+            "builder_id": "github-actions",
+            "build_type": "${{ matrix.build_type }}",
+            "source_repo": "${{ github.server_url }}/${{ github.repository }}",
+            "commit_hash": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "build_platform": "linux"
+          }
+          EOF
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: biogears-linux-${{ matrix.build_type }}
+          path: |
+            build/lib/
+            build/bin/
+            build-metadata.json
+
+  test-linux:
+    name: Test BioGears on Linux
+    runs-on: ubuntu-latest
+    needs: build-linux
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: biogears-linux-${{ matrix.build_type }}
+          path: artifacts
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential liblog4cpp5-dev libxerces-c-dev libeigen3-dev
+      
+      - name: Configure for testing
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          
+      - name: Copy artifacts
+        run: |
+          mkdir -p build/lib build/bin
+          cp -r artifacts/lib/* build/lib/ || true
+          cp -r artifacts/bin/* build/bin/ || true
+      
+      - name: Run tests
+        run: |
+          cd build
+          ctest -C ${{ matrix.build_type }} --output-on-failure --parallel $(nproc)
+          ctest -C ${{ matrix.build_type }} --output-on-failure -T test || true
+      
+      - name: Generate test report
+        run: |
+          if [ -f build/Testing/*/Test.xml ]; then
+            mkdir -p test-results
+            cp build/Testing/*/Test.xml test-results/results.xml
+          else
+            echo "No test results found"
+          fi
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results-linux-${{ matrix.build_type }}
+          path: test-results
+
+  # Windows build
+  build-windows:
+    name: Build BioGears on Windows
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+      
+      - name: Install CMake
+        uses: lukka/get-cmake@v3.26.0
+      
+      - name: Install dependencies
+        shell: powershell
+        run: |
+          # Create a directory for dependencies
+          mkdir -p deps
+          cd deps
+          
+          # Download and extract Code Synthesis XSD
+          Invoke-WebRequest -Uri "https://www.codesynthesis.com/download/xsd/4.0/windows/x86_64/xsd-4.0.0-i686-windows.zip" -OutFile "xsd.zip"
+          Expand-Archive -Path "xsd.zip" -DestinationPath .
+          $xsdBin = (Get-Location).Path + "\xsd-4.0.0-i686-windows\bin"
+          echo "PATH=$xsdBin;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
+          
+          # Download and install vcpkg for other dependencies
+          git clone https://github.com/microsoft/vcpkg.git
+          cd vcpkg
+          ./bootstrap-vcpkg.bat
+          ./vcpkg install xerces-c:x64-windows log4cpp:x64-windows eigen3:x64-windows
+          
+          # Set vcpkg toolchain file for CMake
+          $vcpkgToolchain = (Get-Location).Path + "\scripts\buildsystems\vcpkg.cmake"
+          echo "VCPKG_TOOLCHAIN_FILE=$vcpkgToolchain" | Out-File -FilePath $env:GITHUB_ENV -Append
+      
+      - name: Configure CMake
+        shell: cmd
+        run: |
+          mkdir build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_TOOLCHAIN_FILE=%VCPKG_TOOLCHAIN_FILE% -DVCPKG_TARGET_TRIPLET=x64-windows
+      
+      - name: Build BioGears
+        shell: cmd
+        run: |
+          cd build
+          cmake --build . --config ${{ matrix.build_type }} --parallel %NUMBER_OF_PROCESSORS%
+          
+      - name: Create build metadata
+        shell: powershell
+        run: |
+          $metadata = @{
+            builder_id = "github-actions"
+            build_type = "${{ matrix.build_type }}"
+            source_repo = "${{ github.server_url }}/${{ github.repository }}"
+            commit_hash = "${{ github.sha }}"
+            build_timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            build_platform = "windows"
+          }
+          $metadata | ConvertTo-Json | Out-File -FilePath build-metadata.json
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: biogears-windows-${{ matrix.build_type }}
+          path: |
+            build\lib\${{ matrix.build_type }}\
+            build\bin\${{ matrix.build_type }}\
+            build-metadata.json
+
+  test-windows:
+    name: Test BioGears on Windows
+    runs-on: windows-latest
+    needs: build-windows
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: biogears-windows-${{ matrix.build_type }}
+          path: artifacts
+      
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+      
+      - name: Install CMake
+        uses: lukka/get-cmake@v3.26.0
+      
+      - name: Install dependencies
+        shell: powershell
+        run: |
+          # Install dependencies using vcpkg
+          git clone https://github.com/microsoft/vcpkg.git
+          cd vcpkg
+          ./bootstrap-vcpkg.bat
+          ./vcpkg install xerces-c:x64-windows log4cpp:x64-windows eigen3:x64-windows
+          
+          # Set vcpkg toolchain file for CMake
+          $vcpkgToolchain = (Get-Location).Path + "\scripts\buildsystems\vcpkg.cmake"
+          echo "VCPKG_TOOLCHAIN_FILE=$vcpkgToolchain" | Out-File -FilePath $env:GITHUB_ENV -Append
+      
+      - name: Configure for testing
+        shell: cmd
+        run: |
+          mkdir build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_TOOLCHAIN_FILE=%VCPKG_TOOLCHAIN_FILE% -DVCPKG_TARGET_TRIPLET=x64-windows
+      
+      - name: Copy artifacts
+        shell: powershell
+        run: |
+          mkdir -p build\lib\${{ matrix.build_type }} build\bin\${{ matrix.build_type }}
+          Copy-Item -Path artifacts\lib\${{ matrix.build_type }}\* -Destination build\lib\${{ matrix.build_type }}\ -Recurse -ErrorAction SilentlyContinue
+          Copy-Item -Path artifacts\bin\${{ matrix.build_type }}\* -Destination build\bin\${{ matrix.build_type }}\ -Recurse -ErrorAction SilentlyContinue
+      
+      - name: Run tests
+        shell: cmd
+        run: |
+          cd build
+          ctest -C ${{ matrix.build_type }} --output-on-failure --parallel %NUMBER_OF_PROCESSORS%
+          ctest -C ${{ matrix.build_type }} --output-on-failure -T test || echo "Some tests failed, continuing"
+      
+      - name: Generate test report
+        shell: powershell
+        run: |
+          if (Test-Path -Path build\Testing\*\Test.xml) {
+            mkdir -p test-results
+            Copy-Item -Path build\Testing\*\Test.xml -Destination test-results\results.xml
+          } else {
+            Write-Output "No test results found"
+          }
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results-windows-${{ matrix.build_type }}
+          path: test-results
+
+  # macOS build
+  build-macos:
+    name: Build BioGears on macOS
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install cmake eigen log4cpp xerces-c
+          
+          # Download and install CodeSynthesis XSD
+          curl -L https://www.codesynthesis.com/download/xsd/4.0/macosx/x86_64/xsd-4.0.0-x86_64-macosx.tar.bz2 -o xsd.tar.bz2
+          tar -xjf xsd.tar.bz2
+          echo "PATH=$(pwd)/xsd-4.0.0-x86_64-macosx/bin:$PATH" >> $GITHUB_ENV
+      
+      - name: Configure CMake
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      
+      - name: Build BioGears
+        run: |
+          cd build
+          cmake --build . --parallel $(sysctl -n hw.ncpu)
+          
+      - name: Create build metadata
+        run: |
+          cat > build-metadata.json << EOF
+          {
+            "builder_id": "github-actions",
+            "build_type": "${{ matrix.build_type }}",
+            "source_repo": "${{ github.server_url }}/${{ github.repository }}",
+            "commit_hash": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "build_platform": "macos"
+          }
+          EOF
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: biogears-macos-${{ matrix.build_type }}
+          path: |
+            build/lib/
+            build/bin/
+            build-metadata.json
+
+  test-macos:
+    name: Test BioGears on macOS
+    runs-on: macos-latest
+    needs: build-macos
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: biogears-macos-${{ matrix.build_type }}
+          path: artifacts
+      
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install cmake eigen log4cpp xerces-c
+      
+      - name: Configure for testing
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          
+      - name: Copy artifacts
+        run: |
+          mkdir -p build/lib build/bin
+          cp -r artifacts/lib/* build/lib/ || true
+          cp -r artifacts/bin/* build/bin/ || true
+      
+      - name: Run tests
+        run: |
+          cd build
+          ctest -C ${{ matrix.build_type }} --output-on-failure --parallel $(sysctl -n hw.ncpu)
+          ctest -C ${{ matrix.build_type }} --output-on-failure -T test || true
+      
+      - name: Generate test report
+        run: |
+          if [ -f build/Testing/*/Test.xml ]; then
+            mkdir -p test-results
+            cp build/Testing/*/Test.xml test-results/results.xml
+          else
+            echo "No test results found"
+          fi
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results-macos-${{ matrix.build_type }}
+          path: test-results
+
+  # Package build artifacts
+  package:
+    name: Package BioGears Builds
+    needs: [test-linux, test-windows, test-macos]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        
+      - name: Set up environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip jq
+          
+      - name: Package Release builds
+        run: |
+          mkdir -p releases
+          
+          # Package Linux Release
+          mkdir -p linux-release
+          cp -r biogears-linux-Release/* linux-release/ || true
+          VERSION=$(jq -r '.commit_hash' linux-release/build-metadata.json | cut -c1-8)
+          DATE=$(date +%Y%m%d)
+          zip -r releases/biogears-linux-${DATE}-${VERSION}.zip linux-release
+          
+          # Package Windows Release
+          mkdir -p windows-release
+          cp -r biogears-windows-Release/* windows-release/ || true
+          zip -r releases/biogears-windows-${DATE}-${VERSION}.zip windows-release
+          
+          # Package macOS Release
+          mkdir -p macos-release
+          cp -r biogears-macos-Release/* macos-release/ || true
+          zip -r releases/biogears-macos-${DATE}-${VERSION}.zip macos-release
+          
+          # Create combined SBOM
+          echo "Creating combined SBOM for all platforms..."
+          cat > combined-sbom.json << EOF
+          {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.4",
+            "version": 1,
+            "serialNumber": "urn:uuid:$(uuidgen)",
+            "metadata": {
+              "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+              "tools": [
+                {
+                  "vendor": "BioGears",
+                  "name": "BioGears Build Pipeline",
+                  "version": "${DATE}-${VERSION}"
+                }
+              ],
+              "component": {
+                "type": "application",
+                "name": "BioGears",
+                "version": "${DATE}-${VERSION}"
+              }
+            },
+            "components": [
+              {
+                "type": "application",
+                "name": "BioGears Linux",
+                "version": "${DATE}-${VERSION}",
+                "purl": "pkg:github/${{ github.repository }}/linux@${DATE}-${VERSION}"
+              },
+              {
+                "type": "application",
+                "name": "BioGears Windows",
+                "version": "${DATE}-${VERSION}",
+                "purl": "pkg:github/${{ github.repository }}/windows@${DATE}-${VERSION}"
+              },
+              {
+                "type": "application",
+                "name": "BioGears macOS",
+                "version": "${DATE}-${VERSION}",
+                "purl": "pkg:github/${{ github.repository }}/macos@${DATE}-${VERSION}"
+              }
+            ]
+          }
+          EOF
+          
+      - name: Upload packaged releases
+        uses: actions/upload-artifact@v3
+        with:
+          name: biogears-releases
+          path: |
+            releases/*.zip
+            combined-sbom.json
+            
+  # Create GitHub release (on tags only)
+  release:
+    name: Create GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download packaged releases
+        uses: actions/download-artifact@v3
+        with:
+          name: biogears-releases
+          
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            releases/*.zip
+            combined-sbom.json
+          draft: true
+          generate_release_notes: true 
