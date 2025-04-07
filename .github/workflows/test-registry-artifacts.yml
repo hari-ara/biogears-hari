@@ -84,8 +84,8 @@ jobs:
           name: image-digests
           path: image-digests.txt
 
-  security-scan:
-    name: Security Scanning
+  generate-sboms-and-scan:
+    name: Generate SBOMs and Scan
     needs: build-docker
     runs-on: ubuntu-latest
     
@@ -107,70 +107,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y trivy
       
-      - name: Scan Images with Trivy
+      - name: Generate SBOMs and Scan for Vulnerabilities
         run: |
-          # Scan external image
+          # Generate SBOM and scan external image (all in one command)
+          trivy image --format cyclonedx --output sbom-external-with-vulns.cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears-external:test
+          
+          # Generate SBOM and scan builder image (all in one command)
+          trivy image --format cyclonedx --output sbom-builder-with-vulns.cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears-builder:test
+          
+          # Generate SBOM and scan webgen image (all in one command)
+          trivy image --format cyclonedx --output sbom-webgen-with-vulns.cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears-webgen:test
+          
+          # Also generate JSON format scan results for policy evaluation
           trivy image --format json --output trivy-external.json ghcr.io/${{ github.repository_owner }}/biogears-external:test
-          
-          # Scan builder image
           trivy image --format json --output trivy-builder.json ghcr.io/${{ github.repository_owner }}/biogears-builder:test
-          
-          # Scan webgen image
           trivy image --format json --output trivy-webgen.json ghcr.io/${{ github.repository_owner }}/biogears-webgen:test
-      
-      - name: Upload Scan Results
-        uses: actions/upload-artifact@v3
-        with:
-          name: trivy-scans
-          path: trivy-*.json
-
-  generate-sboms:
-    name: Generate SBOMs
-    needs: [build-docker, security-scan]
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Download Scan Results
-        uses: actions/download-artifact@v3
-        with:
-          name: trivy-scans
-      
-      - name: Install Syft and CycloneDX
-        run: |
-          # Install Syft for SBOM generation
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          
-          # Install CycloneDX CLI
-          wget https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.24.0/cyclonedx-linux-x64 -O /usr/local/bin/cyclonedx
-          chmod +x /usr/local/bin/cyclonedx
-      
-      - name: Generate SBOMs
-        run: |
-          # Generate SBOMs with Syft
-          syft ghcr.io/${{ github.repository_owner }}/biogears-external:test -o cyclonedx-json=sbom-external.cyclonedx.json
-          syft ghcr.io/${{ github.repository_owner }}/biogears-builder:test -o cyclonedx-json=sbom-builder.cyclonedx.json
-          syft ghcr.io/${{ github.repository_owner }}/biogears-webgen:test -o cyclonedx-json=sbom-webgen.cyclonedx.json
-          
-          # Merge vulnerabilities into SBOMs
-          cyclonedx merge --input-files sbom-external.cyclonedx.json trivy-external.json --output-file sbom-external-with-vulns.cyclonedx.json
-          cyclonedx merge --input-files sbom-builder.cyclonedx.json trivy-builder.json --output-file sbom-builder-with-vulns.cyclonedx.json
-          cyclonedx merge --input-files sbom-webgen.cyclonedx.json trivy-webgen.json --output-file sbom-webgen-with-vulns.cyclonedx.json
       
       - name: Upload SBOMs
         uses: actions/upload-artifact@v3
         with:
           name: sbom-files
           path: sbom-*-with-vulns.cyclonedx.json
+      
+      - name: Upload Scan Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: trivy-scans
+          path: trivy-*.json
 
   create-policies:
     name: Create Validation Policies
@@ -459,7 +422,7 @@ jobs:
 
   generate-attestations:
     name: Generate Attestations
-    needs: [build-docker, security-scan, generate-sboms, create-policies]
+    needs: [build-docker, generate-sboms-and-scan, create-policies]
     runs-on: ubuntu-latest
     
     steps:
@@ -592,7 +555,7 @@ jobs:
 
   publish-artifacts:
     name: Publish Artifacts to Registry
-    needs: [build-docker, security-scan, generate-sboms, create-policies, generate-attestations]
+    needs: [build-docker, generate-sboms-and-scan, create-policies, generate-attestations]
     runs-on: ubuntu-latest
     
     steps:
