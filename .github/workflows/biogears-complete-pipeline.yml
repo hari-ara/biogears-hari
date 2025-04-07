@@ -129,6 +129,43 @@ jobs:
             
             echo "Created Dockerfiles:"
             find docker -name "Dockerfile" -type f | tee all_dockerfiles.txt
+          else
+            # Fix any problematic Dockerfiles in the repository
+            echo "Checking Dockerfiles for issues..."
+            for dockerfile in $(cat all_dockerfiles.txt); do
+              echo "Checking $dockerfile"
+              
+              # Fix common issues like invalid FROM lines
+              if grep -q "^FROM biogears-external" "$dockerfile"; then
+                echo "Found problematic FROM line in $dockerfile, fixing it"
+                # Create backup
+                cp "$dockerfile" "${dockerfile}.bak"
+                # Replace with correct image reference
+                sed -i "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" "$dockerfile"
+                echo "Fixed $dockerfile:"
+                grep "^FROM" "$dockerfile"
+              fi
+              
+              # Check for variations with whitespace or versions
+              if grep -q "^FROM[[:space:]]*biogears-external:" "$dockerfile"; then
+                echo "Found problematic versioned FROM line in $dockerfile, fixing it"
+                cp "$dockerfile" "${dockerfile}.bak2"
+                sed -i "s|^FROM[[:space:]]*biogears-external:|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:|g" "$dockerfile"
+                echo "Fixed $dockerfile:"
+                grep "^FROM" "$dockerfile"
+              fi
+              
+              # Also fix any FROM lines referencing biogears-builder
+              if grep -q "^FROM biogears-builder" "$dockerfile"; then
+                echo "Found problematic builder FROM line in $dockerfile, fixing it"
+                # Create backup
+                cp "$dockerfile" "${dockerfile}.bak"
+                # Replace with correct image reference  
+                sed -i "s|^FROM biogears-builder|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest|g" "$dockerfile"
+                echo "Fixed $dockerfile:"
+                grep "^FROM" "$dockerfile"
+              fi
+            done
           fi
           
           # Pick the first Dockerfile for external dependencies
@@ -188,12 +225,43 @@ jobs:
           echo "Using Dockerfile at: $BUILDER_DOCKERFILE"
           DOCKERFILE_DIR=$(dirname "$BUILDER_DOCKERFILE")
           
+          # Check for ARG issues in the builder Dockerfile
+          if [ -f "$BUILDER_DOCKERFILE" ]; then
+            echo "Checking $BUILDER_DOCKERFILE for ARG issues"
+            
+            # If the Dockerfile is using ARG EXTERNAL_IMAGE but we don't specify it
+            if grep -q "ARG EXTERNAL_IMAGE" "$BUILDER_DOCKERFILE" && grep -q "FROM \${EXTERNAL_IMAGE}" "$BUILDER_DOCKERFILE"; then
+              echo "Dockerfile is using ARG EXTERNAL_IMAGE, will provide it in build"
+              EXTERNAL_ARG="--build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest"
+            else
+              EXTERNAL_ARG=""
+              
+              # If FROM doesn't use the ARG, make sure it's properly referenced
+              if grep -q "^FROM biogears-external" "$BUILDER_DOCKERFILE"; then
+                echo "Fixing FROM line in $BUILDER_DOCKERFILE"
+                sed -i "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" "$BUILDER_DOCKERFILE"
+              fi
+            fi
+            
+            # Display the actual FROM line being used
+            echo "FROM line in Dockerfile:"
+            grep "^FROM" "$BUILDER_DOCKERFILE" || echo "No FROM line found"
+          fi
+          
           # Build the BioGears builder image
           echo "Building biogears-builder image..."
-          docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
-            --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest \
-            --progress=plain \
-            -f "$BUILDER_DOCKERFILE" "$DOCKERFILE_DIR"
+          if [ -n "$EXTERNAL_ARG" ]; then
+            echo "Using external image arg: $EXTERNAL_ARG"
+            docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
+              $EXTERNAL_ARG \
+              --progress=plain \
+              -f "$BUILDER_DOCKERFILE" "$DOCKERFILE_DIR"
+          else
+            echo "Not using external image arg"
+            docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
+              --progress=plain \
+              -f "$BUILDER_DOCKERFILE" "$DOCKERFILE_DIR"
+          fi
           
           # Tag with date-based version
           SHORT_SHA="${{ github.sha }}"
