@@ -1,5 +1,5 @@
 FROM ubuntu:18.04
-RUN apt update && apt -y install git wget ninja-build libncurses5-dev build-essential g++ automake libeigen3-dev liblog4cpp5-dev libxerces-c-dev
+RUN apt update && apt -y install git wget ninja-build libncurses5-dev build-essential g++ automake libeigen3-dev liblog4cpp5-dev libxerces-c-dev libssl-dev
 WORKDIR /root/src
 
 # Install a newer version of CMake (3.20.0 or higher as required)
