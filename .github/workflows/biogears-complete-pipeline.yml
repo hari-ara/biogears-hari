@@ -114,13 +114,27 @@ jobs:
             echo "RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 --slave /usr/bin/g++ g++ /usr/bin/g++-11" >> docker/modified/Dockerfile.builder
             echo "RUN gcc --version && g++ --version" >> docker/modified/Dockerfile.builder
             
-            # Configure CMake with comprehensive C++20 support
-            echo "# Tell CMake to use C++20 standard with all necessary flags" >> docker/modified/Dockerfile.builder
-            echo "RUN cd /opt/biogears/core/build && cmake -DCMAKE_CXX_STANDARD=20 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF -DCMAKE_CXX_FLAGS=\"-std=c++20\" .." >> docker/modified/Dockerfile.builder
+            # Upgraded CMake for better C++20 support
+            echo "# Install newer CMake for better C++20 support" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-get update && apt-get install -y cmake-data software-properties-common lsb-release apt-transport-https ca-certificates" >> docker/modified/Dockerfile.builder
+            echo "RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-add-repository \"deb https://apt.kitware.com/ubuntu/ \$(lsb_release -cs) main\"" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-get update && apt-get install -y cmake" >> docker/modified/Dockerfile.builder
+            echo "RUN cmake --version" >> docker/modified/Dockerfile.builder
             
-            # Add compiler flags directly to the make command
-            echo "# Run make with explicit C++20 flags" >> docker/modified/Dockerfile.builder
-            echo "RUN cd /opt/biogears/core/build && CXXFLAGS='-std=c++20 -fconcepts' make install || true" >> docker/modified/Dockerfile.builder
+            # Configure CMake with advanced C++20 support for GCC-11
+            echo "# Tell CMake to use C++20 standard with explicit GCC-11 configuration" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && cmake \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_STANDARD=20 \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_STANDARD_REQUIRED=ON \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_EXTENSIONS=OFF \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_FLAGS=\"-std=gnu++20\" \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_C_COMPILER=/usr/bin/gcc-11 \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_COMPILER=/usr/bin/g++-11 .." >> docker/modified/Dockerfile.builder
+            
+            # Add compiler flags directly to the make command with diagnostics
+            echo "# Run make with explicit C++20 flags for GCC-11" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && CXXFLAGS='-std=gnu++20 -fconcepts' make install || true" >> docker/modified/Dockerfile.builder
             
             # Add debugging commands to verify directory permissions
             echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
@@ -166,13 +180,27 @@ jobs:
             echo "RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 --slave /usr/bin/g++ g++ /usr/bin/g++-11" >> docker/modified/Dockerfile.builder
             echo "RUN gcc --version && g++ --version" >> docker/modified/Dockerfile.builder
             
-            # Configure CMake with comprehensive C++20 support
-            echo "# Tell CMake to use C++20 standard with all necessary flags" >> docker/modified/Dockerfile.builder
-            echo "RUN cd /opt/biogears/core/build && cmake -DCMAKE_CXX_STANDARD=20 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF -DCMAKE_CXX_FLAGS=\"-std=c++20\" .." >> docker/modified/Dockerfile.builder
+            # Upgraded CMake for better C++20 support
+            echo "# Install newer CMake for better C++20 support" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-get update && apt-get install -y cmake-data software-properties-common lsb-release apt-transport-https ca-certificates" >> docker/modified/Dockerfile.builder
+            echo "RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-add-repository \"deb https://apt.kitware.com/ubuntu/ \$(lsb_release -cs) main\"" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-get update && apt-get install -y cmake" >> docker/modified/Dockerfile.builder
+            echo "RUN cmake --version" >> docker/modified/Dockerfile.builder
             
-            # Add compiler flags directly to the make command
-            echo "# Run make with explicit C++20 flags" >> docker/modified/Dockerfile.builder
-            echo "RUN cd /opt/biogears/core/build && CXXFLAGS='-std=c++20 -fconcepts' make install || true" >> docker/modified/Dockerfile.builder
+            # Configure CMake with advanced C++20 support for GCC-11
+            echo "# Tell CMake to use C++20 standard with explicit GCC-11 configuration" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && cmake \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_STANDARD=20 \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_STANDARD_REQUIRED=ON \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_EXTENSIONS=OFF \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_FLAGS=\"-std=gnu++20\" \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_C_COMPILER=/usr/bin/gcc-11 \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_COMPILER=/usr/bin/g++-11 .." >> docker/modified/Dockerfile.builder
+            
+            # Add compiler flags directly to the make command with diagnostics
+            echo "# Run make with explicit C++20 flags for GCC-11" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && CXXFLAGS='-std=gnu++20 -fconcepts' make install || true" >> docker/modified/Dockerfile.builder
             
             # Add debugging commands to verify directory permissions
             echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
