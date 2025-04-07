@@ -20,27 +20,30 @@ jobs:
         with:
           fetch-depth: 0
       
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
       - name: Debug environment
         run: |
-          echo "GitHub runner environment:"
+          echo "GitHub runner environment info:"
+          uname -a
           echo "Docker version:"
           docker --version || echo "Docker not available"
           
-          echo "Docker Compose:"
+          echo "Docker Compose status - before installation:"
           docker compose version || echo "Docker Compose V2 not available"
           docker-compose --version || echo "Legacy Docker Compose not available"
           
+          echo "Content of docker directory:"
+          ls -la docker/ || echo "Docker directory not found"
+          
           echo "Checking for docker-compose.yml:"
-          ls -la
           if [ -f "docker-compose.yml" ]; then
-            echo "docker-compose.yml exists"
+            echo "docker-compose.yml exists:"
             cat docker-compose.yml
           else
-            echo "docker-compose.yml does not exist"
+            echo "docker-compose.yml not found"
           fi
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
       
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v2
@@ -61,130 +64,237 @@ jobs:
             echo "--------------------"
           done
       
-      # Ensure both Docker Compose V1 and V2 are available
-      - name: Setup Docker Compose
+      - name: Setup Docker Compose V1
         run: |
-          # Check if Docker Compose V2 plugin is available
-          if ! docker compose version &>/dev/null; then
-            echo "Docker Compose V2 plugin not available, setting up..."
-            DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
-            mkdir -p $DOCKER_CONFIG/cli-plugins
-            COMPOSE_LATEST=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep "tag_name" | cut -d '"' -f 4)
-            echo "Latest Docker Compose version: $COMPOSE_LATEST"
-            curl -sL "https://github.com/docker/compose/releases/download/${COMPOSE_LATEST}/docker-compose-$(uname -s)-$(uname -m)" -o $DOCKER_CONFIG/cli-plugins/docker-compose
-            chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
-            docker compose version
-          else
-            echo "Docker Compose V2 plugin already available:"
-            docker compose version
-          fi
+          echo "Installing Docker Compose V1..."
+          DOCKER_COMPOSE_VERSION=1.29.2
           
-          # Also install standalone Docker Compose V1 for compatibility
-          if ! command -v docker-compose &>/dev/null; then
-            echo "Docker Compose V1 not found, installing..."
-            sudo curl -SL "https://github.com/docker/compose/releases/download/v1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            sudo chmod +x /usr/local/bin/docker-compose
-            docker-compose --version
-          else
-            echo "Docker Compose V1 already available:"
-            docker-compose --version
-          fi
+          # Download Docker Compose binary
+          sudo curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          
+          # Apply executable permissions
+          sudo chmod +x /usr/local/bin/docker-compose
+          
+          # Verify installation
+          docker-compose --version
+
+      - name: Setup Docker Compose V2
+        run: |
+          echo "Setting up Docker Compose V2..."
+          
+          # Create Docker CLI plugins directory
+          mkdir -p $HOME/.docker/cli-plugins
+          
+          # Download Docker Compose binary
+          curl -SL "https://github.com/docker/compose/releases/download/v2.19.1/docker-compose-$(uname -s)-$(uname -m)" -o $HOME/.docker/cli-plugins/docker-compose
+          
+          # Apply executable permissions
+          chmod +x $HOME/.docker/cli-plugins/docker-compose
+          
+          # Verify installation
+          docker compose version
+      
+      - name: Verify Docker Compose Installation
+        run: |
+          echo "Verifying Docker Compose installations:"
+          
+          # Verify Docker Compose V1
+          which docker-compose || echo "docker-compose command not found"
+          docker-compose --version || echo "docker-compose failed to execute"
+          
+          # Verify Docker Compose V2
+          docker compose version || echo "docker compose plugin failed to execute"
+          
+          # Check paths
+          echo "PATH: $PATH"
+          echo "Docker CLI plugins:"
+          ls -la $HOME/.docker/cli-plugins/ || echo "CLI plugins directory not found"
+          
+          echo "Location of docker-compose binary:"
+          which docker-compose || echo "docker-compose not in PATH"
       
       - name: Build External Base Image
         run: |
           # Build the external dependencies image first
           echo "Building biogears-external image..."
           
-          docker build -t ghcr.io/${{ github.repository_owner }}/biogears-external:latest -f docker/external/Dockerfile docker/external
+          docker build -t ghcr.io/${{ github.repository_owner }}/biogears-external:latest --progress=plain -f docker/external/Dockerfile docker/external
+          
+          # Tag with date-based version
+          SHORT_SHA="${{ github.sha }}"
+          DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-external:latest ghcr.io/${{ github.repository_owner }}/biogears-external:${DATE_VERSION}
           
           # Push to GitHub Container Registry
           docker push ghcr.io/${{ github.repository_owner }}/biogears-external:latest
+          docker push ghcr.io/${{ github.repository_owner }}/biogears-external:${DATE_VERSION}
           
           # Get image digest
           EXTERNAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-external:latest | cut -d'@' -f2 || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-external:latest)
           echo "EXTERNAL_DIGEST=$EXTERNAL_DIGEST" > image-digests.txt
+          echo "EXTERNAL_VERSION=$DATE_VERSION" >> image-digests.txt
           echo "External image digest: $EXTERNAL_DIGEST"
       
-      - name: Modify docker-compose.yml for GitHub Container Registry
+      - name: Prepare BioGears build with Docker Compose
         run: |
           if [ -f "docker-compose.yml" ]; then
-            echo "Updating docker-compose.yml to use GitHub Container Registry..."
-            # Create a backup
-            cp docker-compose.yml docker-compose.yml.bak
+            # Create a modified docker-compose.yml for GitHub Container Registry
+            echo "Creating modified docker-compose file for GitHub Container Registry..."
             
-            # Update image references to use GHCR
-            sed -i 's|image: biogears-external|image: ghcr.io/${{ github.repository_owner }}/biogears-external:latest|g' docker-compose.yml
-            sed -i 's|image: biogears-builder|image: ghcr.io/${{ github.repository_owner }}/biogears-builder:latest|g' docker-compose.yml
-            sed -i 's|image: biogears-webgen|image: ghcr.io/${{ github.repository_owner }}/biogears-webgen:latest|g' docker-compose.yml
+            # First get the values from the original
+            cp docker-compose.yml docker-compose.original.yml
             
-            echo "Updated docker-compose.yml:"
-            cat docker-compose.yml
+            # Create a new file to avoid modifying the original
+            cat > docker-compose.ghcr.yml << EOF
+          version: "2"
+
+          services:
+            biogears-external:
+              image: ghcr.io/${{ github.repository_owner }}/biogears-external:latest
+            
+            biogears-builder:
+              image: ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+              working_dir: /opt/biogears/core/build
+              volumes:
+                - ./:/opt/biogears/core
+                - ../validation:/opt/biogears/validation
+              tty: true
+          EOF
+          
+            echo "Created docker-compose.ghcr.yml:"
+            cat docker-compose.ghcr.yml
           else
-            echo "No docker-compose.yml found to modify."
+            echo "No docker-compose.yml found. Will create a simple one for building..."
+            
+            # Create a simple compose file for building
+            cat > docker-compose.ghcr.yml << EOF
+          version: "2"
+
+          services:
+            biogears-external:
+              image: ghcr.io/${{ github.repository_owner }}/biogears-external:latest
+            
+            biogears-builder:
+              build:
+                context: ./docker/release
+                args:
+                  EXTERNAL_IMAGE: ghcr.io/${{ github.repository_owner }}/biogears-external:latest
+              image: ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+          EOF
+            
+            echo "Created docker-compose.ghcr.yml:"
+            cat docker-compose.ghcr.yml
           fi
       
-      - name: Build BioGears with Docker Compose
+      - name: Build BioGears with Docker
         run: |
-          if [ -f "docker-compose.yml" ]; then
-            echo "Building with docker-compose..."
+          SHORT_SHA="${{ github.sha }}"
+          DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
+          
+          # Try using Docker Compose first if the file exists
+          if [ -f "docker-compose.ghcr.yml" ]; then
+            echo "Building with Docker Compose..."
             
             # Try with Docker Compose V2 first
             if docker compose version &>/dev/null; then
               echo "Using Docker Compose V2..."
-              # Print services for debugging
-              docker compose config --services
+              # Check configuration
+              docker compose -f docker-compose.ghcr.yml config
               
-              # Build builder image
-              docker compose build biogears-builder
-              
-              # Check if build succeeded
-              if [ $? -eq 0 ]; then
-                echo "Successfully built biogears-builder with Docker Compose V2"
-                docker compose push biogears-builder
-                docker images
+              # Check if biogears-builder service has a build section
+              if docker compose -f docker-compose.ghcr.yml config | grep -q "build:"; then
+                # Build using Docker Compose
+                echo "Building builder image with Docker Compose V2..."
+                docker compose -f docker-compose.ghcr.yml build biogears-builder
+                
+                # Tag with date-based version
+                docker tag ghcr.io/${{ github.repository_owner }}/biogears-builder:latest ghcr.io/${{ github.repository_owner }}/biogears-builder:${DATE_VERSION}
+                
+                # Push to GitHub Container Registry
+                docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+                docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:${DATE_VERSION}
               else
-                echo "Docker Compose V2 build failed, falling back to V1..."
-                # Fallback to Docker Compose V1
-                docker-compose build biogears-builder
-                docker-compose push biogears-builder
+                echo "No build section found in docker-compose.ghcr.yml, using direct Docker build..."
+                # Build directly with Docker
+                if [ -f "docker/release/Dockerfile" ]; then
+                  echo "Building with docker/release/Dockerfile..."
+                  docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
+                    --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
+                    --progress=plain \
+                    -f docker/release/Dockerfile .
+                elif [ -f "docker/builder/Dockerfile" ]; then
+                  echo "Building with docker/builder/Dockerfile..."
+                  docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
+                    --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
+                    --progress=plain \
+                    -f docker/builder/Dockerfile .
+                else
+                  # Try to find any other suitable Dockerfile
+                  for df in $(find docker -name "Dockerfile" | grep -v external); do
+                    echo "Found Dockerfile: $df"
+                    docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
+                      --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
+                      --progress=plain \
+                      -f $df .
+                    break
+                  done
+                fi
+                
+                # Tag with date-based version
+                docker tag ghcr.io/${{ github.repository_owner }}/biogears-builder:latest ghcr.io/${{ github.repository_owner }}/biogears-builder:${DATE_VERSION}
+                
+                # Push to GitHub Container Registry
+                docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+                docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:${DATE_VERSION}
               fi
             else
-              echo "Using Docker Compose V1..."
-              docker-compose build biogears-builder
-              docker-compose push biogears-builder
+              echo "Docker Compose V2 not available, falling back to V1..."
+              # Check configuration
+              docker-compose -f docker-compose.ghcr.yml config
+              
+              # Build using Docker Compose V1
+              docker-compose -f docker-compose.ghcr.yml build biogears-builder
+              
+              # Tag with date-based version
+              docker tag ghcr.io/${{ github.repository_owner }}/biogears-builder:latest ghcr.io/${{ github.repository_owner }}/biogears-builder:${DATE_VERSION}
+              
+              # Push to GitHub Container Registry
+              docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+              docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:${DATE_VERSION}
             fi
-            
-            # Get image digest
-            BUILDER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-builder:latest | cut -d'@' -f2 || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-builder:latest)
-            echo "BUILDER_DIGEST=$BUILDER_DIGEST" >> image-digests.txt
-            echo "Builder image digest: $BUILDER_DIGEST"
           else
-            echo "No docker-compose.yml found, building directly with Docker..."
+            echo "No docker-compose file created, building directly with Docker..."
             
-            # Check if we have a builder Dockerfile
             if [ -f "docker/release/Dockerfile" ]; then
-              echo "Using docker/release/Dockerfile..."
+              echo "Building with docker/release/Dockerfile..."
               docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
                 --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
+                --progress=plain \
                 -f docker/release/Dockerfile .
             elif [ -f "docker/builder/Dockerfile" ]; then
-              echo "Using docker/builder/Dockerfile..."
+              echo "Building with docker/builder/Dockerfile..."
               docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
                 --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
+                --progress=plain \
                 -f docker/builder/Dockerfile .
             else
               echo "No suitable Dockerfile found for builder."
               exit 1
             fi
             
+            # Tag with date-based version
+            docker tag ghcr.io/${{ github.repository_owner }}/biogears-builder:latest ghcr.io/${{ github.repository_owner }}/biogears-builder:${DATE_VERSION}
+            
             # Push to GitHub Container Registry
             docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
-            
-            # Get image digest
-            BUILDER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-builder:latest | cut -d'@' -f2 || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-builder:latest)
-            echo "BUILDER_DIGEST=$BUILDER_DIGEST" >> image-digests.txt
-            echo "Builder image digest: $BUILDER_DIGEST"
+            docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:${DATE_VERSION}
           fi
+          
+          # Get image digest
+          BUILDER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-builder:latest | cut -d'@' -f2 || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-builder:latest)
+          echo "BUILDER_DIGEST=$BUILDER_DIGEST" >> image-digests.txt
+          echo "BUILDER_VERSION=$DATE_VERSION" >> image-digests.txt
+          echo "Builder image digest: $BUILDER_DIGEST"
       
       - name: Install security tools
         run: |
@@ -213,7 +323,7 @@ jobs:
       
       - name: Generate SBOMs and scan for vulnerabilities
         run: |
-          # Source the image digests
+          # Source the image digests and versions
           source image-digests.txt
           
           # Debug image digests
@@ -232,6 +342,10 @@ jobs:
           echo "Generating vulnerability scan reports..."
           trivy image --format json --output trivy-external.json ghcr.io/${{ github.repository_owner }}/biogears-external:latest
           trivy image --format json --output trivy-builder.json ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+          
+          # Generate HTML reports for better visualization
+          trivy image --format template --template "@/usr/local/lib/trivy/templates/html.tpl" --output trivy-external.html ghcr.io/${{ github.repository_owner }}/biogears-external:latest || echo "HTML report generation failed"
+          trivy image --format template --template "@/usr/local/lib/trivy/templates/html.tpl" --output trivy-builder.html ghcr.io/${{ github.repository_owner }}/biogears-builder:latest || echo "HTML report generation failed"
       
       - name: Create and sign policies
         run: |
@@ -487,7 +601,7 @@ jobs:
           cosign generate-key-pair
           
           for policy_file in policies/rego/*.rego; do
-            cosign sign-blob --key cosign.key "$policy_file" > "$policy_file.sig"
+            cosign sign-blob --key cosign.key "$policy_file" > "$policy_file.sig" || echo "Failed to sign $policy_file"
           done
           
           tar -czvf signed-policies.tar.gz policies/
@@ -513,14 +627,16 @@ jobs:
           cat > external-image-data.json << EOF
           {
             "image_name": "biogears-external",
-            "image_digest": "${EXTERNAL_DIGEST}"
+            "image_digest": "${EXTERNAL_DIGEST}",
+            "image_version": "${EXTERNAL_VERSION}"
           }
           EOF
           
           cat > builder-image-data.json << EOF
           {
             "image_name": "biogears-builder",
-            "image_digest": "${BUILDER_DIGEST}"
+            "image_digest": "${BUILDER_DIGEST}",
+            "image_version": "${BUILDER_VERSION}"
           }
           EOF
           
@@ -547,53 +663,67 @@ jobs:
       
       - name: Publish artifacts with ORAS
         run: |
-          # Set version info
-          SHORT_SHA="${{ github.sha }}"
-          VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
-          echo "Using version: $VERSION"
+          # Source version info
+          source image-digests.txt
           
           # Create artifact directories
-          mkdir -p artifacts/{sboms,attestations,signatures,policies}
+          mkdir -p artifacts/{sboms,attestations,signatures,policies,reports}
           
           # Copy artifacts to their directories
           cp *.cyclonedx.json artifacts/sboms/ || echo "No SBOM files to copy"
           cp *-raw.json artifacts/attestations/ || echo "No attestation files to copy"
           cp -r all-signatures/* artifacts/signatures/ || echo "No signature files to copy"
           cp -r policies/rego/* artifacts/policies/ || echo "No policy files to copy"
+          cp *.html artifacts/reports/ || echo "No HTML reports to copy"
           
           # Create archive files for ORAS
           tar -czf sbom.tar.gz -C artifacts/sboms . || echo "No SBOM artifacts to archive"
           tar -czf attestations.tar.gz -C artifacts/attestations . || echo "No attestation artifacts to archive"
           tar -czf signatures.tar.gz -C artifacts/signatures . || echo "No signature artifacts to archive"
           tar -czf policies.tar.gz -C artifacts/policies . || echo "No policy artifacts to archive"
+          tar -czf reports.tar.gz -C artifacts/reports . || echo "No report artifacts to archive"
           
-          # Push artifacts to registry
+          # Push artifacts to registry with version tags
           REPOSITORY="ghcr.io/${{ github.repository_owner }}/biogears-artifacts"
           
           # Push artifacts if they exist
-          for artifact in sbom attestations signatures policies; do
+          for artifact in sbom attestations signatures policies reports; do
             if [ -f "${artifact}.tar.gz" ]; then
               echo "Pushing ${artifact} artifacts..."
-              oras push "${REPOSITORY}:${artifact}-${VERSION}" "${artifact}.tar.gz:application/tar+gzip" || echo "Failed to push ${artifact}"
+              # Push with both latest and versioned tags
+              oras push "${REPOSITORY}:${artifact}-${EXTERNAL_VERSION}" "${artifact}.tar.gz:application/tar+gzip" || echo "Failed to push ${artifact} with version tag"
+              oras push "${REPOSITORY}:${artifact}-latest" "${artifact}.tar.gz:application/tar+gzip" || echo "Failed to push ${artifact} with latest tag"
             else
               echo "No ${artifact} artifacts to push"
             fi
           done
       
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-artifacts
+          path: |
+            artifacts/
+            *.json
+            *.html
+            *.sig
+      
       - name: Generate summary report
         run: |
+          source image-digests.txt
+          
           cat > biogears-pipeline-report.md << EOF
-          # BioGears Docker Pipeline Report
+          # BioGears Secure CI/CD Pipeline Report
           
           Generated: $(date -u)
-          Version: ${VERSION}
+          Version: ${EXTERNAL_VERSION}
           Branch: ${{ github.ref_name }}
           Commit: ${{ github.sha }}
           
           ## Docker Images
           
-          - External: ghcr.io/${{ github.repository_owner }}/biogears-external:latest
-          - Builder: ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+          - External: ghcr.io/${{ github.repository_owner }}/biogears-external:${EXTERNAL_VERSION}
+          - Builder: ghcr.io/${{ github.repository_owner }}/biogears-builder:${BUILDER_VERSION}
           
           ## Pipeline Steps Completed
           
@@ -604,9 +734,17 @@ jobs:
           - ✅ Attestation Generation
           - ✅ OCI Registry Publication
           
+          ## Artifacts Published to GitHub Container Registry
+          
+          - Images: ghcr.io/${{ github.repository_owner }}/biogears-external, ghcr.io/${{ github.repository_owner }}/biogears-builder
+          - SBOMs: ghcr.io/${{ github.repository_owner }}/biogears-artifacts:sbom-latest
+          - Attestations: ghcr.io/${{ github.repository_owner }}/biogears-artifacts:attestations-latest
+          - Signatures: ghcr.io/${{ github.repository_owner }}/biogears-artifacts:signatures-latest
+          - Policies: ghcr.io/${{ github.repository_owner }}/biogears-artifacts:policies-latest
+          
           ## View in GitHub Container Registry
           
-          - https://github.com/${{ github.repository_owner }}/biogears-external/pkgs/container/biogears-external
-          - https://github.com/${{ github.repository_owner }}/biogears-builder/pkgs/container/biogears-builder
-          - https://github.com/${{ github.repository_owner }}/biogears-artifacts/pkgs/container/biogears-artifacts
-          EOF 
+          - https://github.com/${{ github.repository_owner }}/packages
+          EOF
+          
+          cat biogears-pipeline-report.md >> $GITHUB_STEP_SUMMARY 
