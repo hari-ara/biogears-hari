@@ -1,0 +1,397 @@
+name: Test Registry Artifacts
+
+on:
+  # Run when code is pushed to the haritest branch
+  push:
+    branches:
+      - 'haritest'
+  # Also allow manual trigger
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  generate-and-publish:
+    name: Generate & Publish Test Artifacts
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          
+      - name: Set Version Information
+        run: |
+          # Generate a unique version using branch name and run ID
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          VERSION="${BRANCH_NAME}-${GITHUB_RUN_ID}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Using version: $VERSION"
+          
+      - name: Install Required Tools
+        run: |
+          # Install ORAS
+          curl -LO https://github.com/oras-project/oras/releases/download/v1.2.2/oras_1.2.2_linux_amd64.tar.gz
+          mkdir -p oras-install/
+          tar -zxf oras_1.2.2_linux_amd64.tar.gz -C oras-install/
+          sudo mv oras-install/oras /usr/local/bin/
+          oras version
+          
+          # Install jq
+          sudo apt-get update
+          sudo apt-get install -y jq
+          
+          # Install cosign
+          wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+      
+      - name: Generate Test Artifacts
+        run: |
+          # Create directory structure
+          mkdir -p artifacts/{sboms,attestations,signatures,policies,archives}
+          
+          # Generate sample SBOM
+          cat > artifacts/sboms/sbom-external-with-vulns.cyclonedx.json << EOF
+          {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.4",
+            "serialNumber": "urn:uuid:$(cat /proc/sys/kernel/random/uuid)",
+            "version": 1,
+            "metadata": {
+              "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+              "tools": [
+                {
+                  "vendor": "BioGears",
+                  "name": "TestTool",
+                  "version": "1.0.0"
+                }
+              ]
+            },
+            "components": [
+              {
+                "type": "library",
+                "name": "test-component",
+                "version": "1.0.0"
+              }
+            ]
+          }
+          EOF
+          
+          # Also create SBOM for builder and webgen
+          cp artifacts/sboms/sbom-external-with-vulns.cyclonedx.json artifacts/sboms/sbom-builder-with-vulns.cyclonedx.json
+          cp artifacts/sboms/sbom-external-with-vulns.cyclonedx.json artifacts/sboms/sbom-webgen-with-vulns.cyclonedx.json
+          
+          # Create sample attestation
+          cat > artifacts/attestations/build-intoto-attestation.json << EOF
+          {
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "subject": [{
+              "name": "test-build",
+              "digest": {"sha256": "$(echo -n "testdata" | sha256sum | cut -d' ' -f1)"}
+            }],
+            "predicateType": "https://example.org/attestations/build/v1",
+            "predicate": {
+              "builder_id": "github-actions",
+              "build_type": "Release",
+              "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+              "build_platform": "ubuntu-latest"
+            }
+          }
+          EOF
+          
+          # Create container scan attestation
+          cat > artifacts/attestations/container-scan-intoto-external.json << EOF
+          {
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "subject": [{
+              "name": "container-scan-external",
+              "digest": {"sha256": "$(echo -n "external-container" | sha256sum | cut -d' ' -f1)"}
+            }],
+            "predicateType": "https://example.org/attestations/container-scan/v1",
+            "predicate": {
+              "compliant": true,
+              "critical_vulnerabilities": 0,
+              "high_vulnerabilities": 2,
+              "medium_vulnerabilities": 5,
+              "timestamp": $(date +%s)000000000
+            }
+          }
+          EOF
+          
+          # Create a test policy
+          mkdir -p artifacts/policies/rego
+          cat > artifacts/policies/rego/test-policy.rego << EOF
+          package test
+          
+          default allow = false
+          
+          allow {
+            input.action == "test"
+          }
+          EOF
+          
+          cat > artifacts/policies/rego/sbom_policy.rego << EOF
+          package sbom
+          
+          # SBOM must be in CycloneDX format
+          valid_format {
+              input.bomFormat == "CycloneDX"
+          }
+          
+          # SBOM must have a version specified
+          has_version {
+              input.specVersion != null
+              input.specVersion != ""
+          }
+          
+          # SBOM must have components
+          has_components {
+              count(input.components) > 0
+          }
+          
+          # SBOM is valid if it passes all validation checks
+          valid {
+              valid_format
+              has_version
+              has_components
+          }
+          EOF
+          
+          # Create signature files
+          echo "test signature" > artifacts/signatures/sbom-external.sig
+          echo "test signature" > artifacts/signatures/attestation.sig
+          
+          # Create archives
+          tar -czf artifacts/archives/signatures.tar.gz -C artifacts/signatures . || echo "No signatures to archive"
+          tar -czf artifacts/archives/policies.tar.gz -C artifacts/policies . || echo "No policies to archive"
+          
+          echo "Test artifacts generated successfully"
+          
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Artifacts to GitHub Container Registry
+        run: |
+          # Define standard media types
+          SBOM_TYPE="application/vnd.cyclonedx+json"
+          ATTESTATION_TYPE="application/in-toto+json"
+          SIG_TYPE="application/vnd.sigstore+tar+gzip"
+          POLICY_TYPE="application/vnd.rego+tar+gzip"
+          
+          REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
+          
+          push_with_retry() {
+            local repo=$1
+            local tag=$2
+            local file=$3
+            local type=$4
+            local attempt=1
+            local max_attempts=3
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "Attempt $attempt to push $file to $repo:$tag"
+              if oras push "${repo}:${tag}" --artifact-type "$type" "$file:$type"; then
+                echo "Successfully pushed $file to $repo:$tag"
+                return 0
+              fi
+              
+              attempt=$((attempt+1))
+              if [ $attempt -le $max_attempts ]; then
+                echo "Push failed, retrying in 5 seconds..."
+                sleep 5
+              else
+                echo "Push failed after $max_attempts attempts"
+                return 1
+              fi
+            done
+          }
+          
+          # Push SBOMs
+          for sbom in artifacts/sboms/sbom-*-with-vulns.cyclonedx.json; do
+            if [ -f "$sbom" ]; then
+              name=$(basename $sbom | sed 's/sbom-\(.*\)-with-vulns.cyclonedx.json/\1/')
+              echo "Pushing $name SBOM..."
+              push_with_retry "${REPOSITORY}/sbom" "${name}-${VERSION}" "$sbom" "$SBOM_TYPE" || echo "Failed to push $name SBOM"
+            fi
+          done
+          
+          # Push attestations
+          for file in artifacts/attestations/*-intoto-*.json; do
+            if [ -f "$file" ]; then
+              name=$(basename $file | sed 's/-intoto-/-/' | sed 's/\.json//')
+              echo "Pushing attestation: $name..."
+              push_with_retry "${REPOSITORY}/attestation" "${name}-${VERSION}" "$file" "$ATTESTATION_TYPE" || echo "Failed to push $name attestation"
+            fi
+          done
+          
+          # Push signatures bundle if it exists
+          if [ -f "artifacts/archives/signatures.tar.gz" ]; then
+            echo "Pushing signatures bundle..."
+            push_with_retry "${REPOSITORY}/signatures" "${VERSION}" \
+              artifacts/archives/signatures.tar.gz "$SIG_TYPE" || echo "Failed to push signatures bundle"
+          fi
+          
+          # Push policies bundle if it exists
+          if [ -f "artifacts/archives/policies.tar.gz" ]; then
+            echo "Pushing policies bundle..."
+            push_with_retry "${REPOSITORY}/policies" "${VERSION}" \
+              artifacts/archives/policies.tar.gz "$POLICY_TYPE" || echo "Failed to push policies bundle"
+          fi
+          
+      - name: Calculate Artifact Sizes
+        run: |
+          # Create a function to safely calculate file size
+          calculate_size() {
+            local file=$1
+            if [ -f "$file" ]; then
+              stat -c%s "$file"
+            else
+              echo "0"
+            fi
+          }
+          
+          # Calculate SBOM sizes
+          for sbom in artifacts/sboms/sbom-*-with-vulns.cyclonedx.json; do
+            if [ -f "$sbom" ]; then
+              name=$(basename $sbom | sed 's/sbom-\(.*\)-with-vulns.cyclonedx.json/\1/')
+              name_upper=$(echo $name | tr '[:lower:]' '[:upper:]')
+              size=$(calculate_size "$sbom")
+              echo "${name_upper}_SBOM_SIZE=$size" >> $GITHUB_ENV
+              echo "Size of $name SBOM: $size bytes"
+            fi
+          done
+          
+          # Calculate other artifact sizes
+          SIGNATURES_SIZE=$(calculate_size "artifacts/archives/signatures.tar.gz")
+          POLICIES_SIZE=$(calculate_size "artifacts/archives/policies.tar.gz")
+          echo "SIGNATURES_SIZE=$SIGNATURES_SIZE" >> $GITHUB_ENV
+          echo "POLICIES_SIZE=$POLICIES_SIZE" >> $GITHUB_ENV
+          echo "Signatures size: $SIGNATURES_SIZE bytes"
+          echo "Policies size: $POLICIES_SIZE bytes"
+          
+      - name: Create and Push Reference Manifest
+        run: |
+          REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
+          
+          # Create reference manifest pointing to all published artifacts
+          cat > reference-manifest.json << EOF
+          {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": "application/vnd.biogears.release",
+            "config": {
+              "mediaType": "application/vnd.oci.empty.v1+json",
+              "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f6f3393a4c",
+              "size": 2
+            },
+            "annotations": {
+              "org.opencontainers.image.created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+              "org.opencontainers.image.version": "${VERSION}",
+              "org.opencontainers.image.title": "BioGears Test Release",
+              "org.opencontainers.image.vendor": "BioGears",
+              "org.opencontainers.image.source": "${{ github.server_url }}/${{ github.repository }}",
+              "org.opencontainers.image.revision": "${{ github.sha }}",
+              "io.biogears.build.workflow": "${{ github.workflow }}",
+              "io.biogears.build.id": "${{ github.run_id }}"
+            },
+            "layers": [
+              {
+                "mediaType": "application/vnd.cyclonedx+json",
+                "size": ${EXTERNAL_SBOM_SIZE:-0},
+                "annotations": {
+                  "org.opencontainers.artifact.description": "External SBOM",
+                  "org.opencontainers.image.title": "external-sbom"
+                }
+              },
+              {
+                "mediaType": "application/vnd.cyclonedx+json",
+                "size": ${BUILDER_SBOM_SIZE:-0},
+                "annotations": {
+                  "org.opencontainers.artifact.description": "Builder SBOM",
+                  "org.opencontainers.image.title": "builder-sbom"
+                }
+              },
+              {
+                "mediaType": "application/vnd.cyclonedx+json",
+                "size": ${WEBGEN_SBOM_SIZE:-0},
+                "annotations": {
+                  "org.opencontainers.artifact.description": "Webgen SBOM",
+                  "org.opencontainers.image.title": "webgen-sbom"
+                }
+              },
+              {
+                "mediaType": "application/vnd.sigstore+tar+gzip",
+                "size": ${SIGNATURES_SIZE:-0},
+                "annotations": {
+                  "org.opencontainers.artifact.description": "Signatures Bundle",
+                  "org.opencontainers.image.title": "signatures-bundle"
+                }
+              },
+              {
+                "mediaType": "application/vnd.rego+tar+gzip",
+                "size": ${POLICIES_SIZE:-0},
+                "annotations": {
+                  "org.opencontainers.artifact.description": "Policies Bundle",
+                  "org.opencontainers.image.title": "policies-bundle"
+                }
+              }
+            ]
+          }
+          EOF
+          
+          # Push the reference manifest
+          oras push \
+            "${REPOSITORY}/release:${VERSION}" \
+            --artifact-type "application/vnd.biogears.release" \
+            --manifest reference-manifest.json
+
+      - name: Verify References
+        run: |
+          REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
+          
+          echo "Trying to discover artifact graph..."
+          oras discover -o tree "${REPOSITORY}/release:${VERSION}" || echo "Could not retrieve artifact graph"
+
+      - name: Generate Registry Report
+        run: |
+          REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
+          
+          echo "# Test Artifacts Published" > test-report.md
+          echo "Generated: $(date -u)" >> test-report.md
+          echo "Version: ${VERSION}" >> test-report.md
+          echo "Branch: ${GITHUB_REF_NAME}" >> test-report.md
+          echo "Run ID: ${GITHUB_RUN_ID}" >> test-report.md
+          echo "" >> test-report.md
+          
+          echo "## Published Artifacts" >> test-report.md
+          echo "" >> test-report.md
+          echo "- SBOMs:" >> test-report.md
+          echo "  - ${REPOSITORY}/sbom:external-${VERSION}" >> test-report.md
+          echo "  - ${REPOSITORY}/sbom:builder-${VERSION}" >> test-report.md
+          echo "  - ${REPOSITORY}/sbom:webgen-${VERSION}" >> test-report.md
+          echo "" >> test-report.md
+          echo "- Attestations:" >> test-report.md
+          echo "  - ${REPOSITORY}/attestation:build-${VERSION}" >> test-report.md
+          echo "  - ${REPOSITORY}/attestation:container-scan-${VERSION}" >> test-report.md
+          echo "" >> test-report.md
+          echo "- Signatures: ${REPOSITORY}/signatures:${VERSION}" >> test-report.md
+          echo "- Policies: ${REPOSITORY}/policies:${VERSION}" >> test-report.md
+          echo "- Reference Manifest: ${REPOSITORY}/release:${VERSION}" >> test-report.md
+          echo "" >> test-report.md
+          
+          echo "## View in GitHub Container Registry" >> test-report.md
+          echo "https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}-test/pkgs/container/release" >> test-report.md
+          
+      - name: Upload Test Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-registry-report
+          path: test-report.md 
