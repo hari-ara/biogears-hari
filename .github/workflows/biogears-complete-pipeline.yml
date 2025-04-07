@@ -56,17 +56,92 @@ jobs:
       - name: Build External Base Image
         shell: bash
         run: |
-          # Simplify Dockerfile discovery with more robust approach
+          # Enhanced debugging for Docker files
           echo "Looking for Dockerfiles..."
           echo "All Dockerfiles in repository:"
           find . -name "Dockerfile" -type f | tee all_dockerfiles.txt
           
+          # Count Dockerfiles
+          DOCKERFILE_COUNT=$(wc -l < all_dockerfiles.txt || echo "0")
+          echo "Found $DOCKERFILE_COUNT Dockerfiles in repository"
+          
+          if [ "$DOCKERFILE_COUNT" -eq "0" ]; then
+            echo "No Dockerfiles found in repository, creating minimal ones"
+            
+            # Create directory for external dependencies Dockerfile
+            mkdir -p docker/external
+            
+            # Create a minimal external dependencies Dockerfile
+            cat > docker/external/Dockerfile << 'EOF'
+            FROM ubuntu:20.04
+            
+            # Install basic dependencies
+            RUN apt-get update && \
+                apt-get install -y \
+                build-essential \
+                cmake \
+                git \
+                wget \
+                libxml2-dev \
+                libxerces-c-dev \
+                liblog4cpp5-dev \
+                libeigen3-dev \
+                && rm -rf /var/lib/apt/lists/*
+            
+            # Install CodeSynthesis XSD
+            RUN wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb && \
+                dpkg -i xsd_4.0.0-1_amd64.deb && \
+                rm xsd_4.0.0-1_amd64.deb
+            
+            ENV PATH="/usr/local/bin:${PATH}"
+            WORKDIR /opt/biogears
+            
+            CMD ["/bin/bash"]
+            EOF
+            
+            # Create directory for builder Dockerfile
+            mkdir -p docker/builder
+            
+            # Create a minimal builder Dockerfile
+            cat > docker/builder/Dockerfile << 'EOF'
+            ARG EXTERNAL_IMAGE=ghcr.io/hari-ara/biogears-hari-external:latest
+            FROM ${EXTERNAL_IMAGE}
+            
+            # Copy source code
+            COPY . /opt/biogears/core
+            
+            # Build BioGears
+            WORKDIR /opt/biogears/core
+            RUN mkdir -p build && \
+                cd build && \
+                cmake .. -DCMAKE_BUILD_TYPE=Release && \
+                cmake --build . --parallel $(nproc) && \
+                cd ..
+            
+            # Copy built libraries and binaries to standard locations
+            RUN mkdir -p /usr/local/lib /usr/local/bin && \
+                cp -r build/lib/* /usr/local/lib/ && \
+                cp -r build/bin/* /usr/local/bin/
+            
+            WORKDIR /opt/biogears
+            CMD ["/bin/bash"]
+            EOF
+            
+            echo "Created Dockerfiles:"
+            find docker -name "Dockerfile" -type f | tee all_dockerfiles.txt
+          fi
+          
           # Pick the first Dockerfile for external dependencies
-          EXTERNAL_DOCKERFILE=$(head -n 1 all_dockerfiles.txt)
+          EXTERNAL_DOCKERFILE=$(grep -i "external" all_dockerfiles.txt | head -n 1)
           
           if [ -z "$EXTERNAL_DOCKERFILE" ]; then
-            echo "ERROR: No Dockerfiles found in repository"
-            exit 1
+            echo "No external Dockerfile found, using the first one"
+            EXTERNAL_DOCKERFILE=$(head -n 1 all_dockerfiles.txt)
+            
+            if [ -z "$EXTERNAL_DOCKERFILE" ]; then
+              echo "ERROR: No Dockerfiles found in repository"
+              exit 1
+            fi
           fi
           
           echo "Using Dockerfile at: $EXTERNAL_DOCKERFILE"
@@ -97,12 +172,17 @@ jobs:
           . ./image-digests.txt || { echo "Failed to load image-digests.txt"; cat ./image-digests.txt; }
           
           # Simplify builder Dockerfile discovery
-          echo "Looking for second Dockerfile for builder..."
-          BUILDER_DOCKERFILE=$(grep -v "^$EXTERNAL_DOCKERFILE$" all_dockerfiles.txt | head -n 1)
+          echo "Looking for builder Dockerfile..."
+          BUILDER_DOCKERFILE=$(grep -i "builder\|release" all_dockerfiles.txt | head -n 1)
           
           if [ -z "$BUILDER_DOCKERFILE" ]; then
-            echo "No second Dockerfile found, using the same one as external"
-            BUILDER_DOCKERFILE=$EXTERNAL_DOCKERFILE
+            echo "No builder Dockerfile found, using a different one from external"
+            BUILDER_DOCKERFILE=$(grep -v "^$EXTERNAL_DOCKERFILE$" all_dockerfiles.txt | head -n 1)
+            
+            if [ -z "$BUILDER_DOCKERFILE" ]; then
+              echo "No other Dockerfile found, using the same one as external"
+              BUILDER_DOCKERFILE=$EXTERNAL_DOCKERFILE
+            fi
           fi
           
           echo "Using Dockerfile at: $BUILDER_DOCKERFILE"
