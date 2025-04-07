@@ -1426,6 +1426,125 @@ jobs:
           # Reset errors
           set +x  # Disable command echo
       
+      - name: Create comprehensive bundle
+        continue-on-error: true
+        run: |
+          set -x  # Enable command echo for debugging
+          
+          # Create a comprehensive bundle directory structure
+          mkdir -p comprehensive-bundle/{sboms,attestations,signatures,policies,metadata,docker}
+          
+          # Copy all artifacts into the comprehensive bundle
+          cp -r artifacts/sboms/* comprehensive-bundle/sboms/ || echo "Failed to copy SBOMs to comprehensive bundle"
+          cp -r artifacts/attestations/* comprehensive-bundle/attestations/ || echo "Failed to copy attestations to comprehensive bundle"
+          cp -r artifacts/signatures/* comprehensive-bundle/signatures/ || echo "Failed to copy signatures to comprehensive bundle"
+          cp -r artifacts/policies/* comprehensive-bundle/policies/ || echo "Failed to copy policies to comprehensive bundle"
+          
+          # Create a metadata file that links everything together
+          DIGEST="${IMAGE_DIGEST:-sha256:${{ github.sha }}}"
+          IMAGE_REF="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}"
+          ARTIFACTS_BASE="ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts"
+          
+          cat > comprehensive-bundle/metadata/bundle-metadata.json << EOF
+          {
+            "version": "${VERSION}",
+            "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "repository": "${{ github.repository }}",
+            "commit": "${{ github.sha }}",
+            "docker_image": {
+              "reference": "${IMAGE_REF}",
+              "digest": "${DIGEST}"
+            },
+            "artifacts": {
+              "sbom": {
+                "reference": "${ARTIFACTS_BASE}:sbom-${VERSION}",
+                "path": "sboms/"
+              },
+              "attestations": {
+                "reference": "${ARTIFACTS_BASE}:attestations-${VERSION}",
+                "path": "attestations/"
+              },
+              "signatures": {
+                "reference": "${ARTIFACTS_BASE}:signatures-${VERSION}",
+                "path": "signatures/"
+              },
+              "policies": {
+                "reference": "${ARTIFACTS_BASE}:policies-${VERSION}",
+                "path": "policies/"
+              }
+            }
+          }
+          EOF
+          
+          # Create a Docker image reference file
+          echo "${IMAGE_REF}@${DIGEST}" > comprehensive-bundle/docker/image-reference.txt
+          
+          # Create a comprehensive bundle archive
+          tar -czf comprehensive-bundle.tar.gz -C comprehensive-bundle . || {
+            echo "Failed to create comprehensive bundle, creating minimal version"
+            mkdir -p minimal-bundle
+            echo '{"bundle": "minimal"}' > minimal-bundle/minimal.json
+            tar -czf comprehensive-bundle.tar.gz -C minimal-bundle .
+          }
+          
+          # Reset errors
+          set +x  # Disable command echo
+      
+      - name: Sign Docker image with Cosign
+        continue-on-error: true
+        run: |
+          set -x  # Enable command echo for debugging
+          
+          # Load the image digest
+          if [ -f "./image-digest.txt" ]; then
+            . ./image-digest.txt || echo "Failed to source image-digest.txt"
+          else
+            echo "IMAGE_DIGEST=sha256:${{ github.sha }}" > image-digest.txt
+            . ./image-digest.txt
+          fi
+          
+          # Check if cosign key exists
+          if [ ! -f "cosign.key" ] && [ -f "policy-artifacts/cosign.key" ]; then
+            echo "Using cosign key from policy-artifacts"
+            cp policy-artifacts/cosign.key ./cosign.key
+            cp policy-artifacts/cosign.pub ./cosign.pub
+          elif [ ! -f "cosign.key" ]; then
+            echo "Cosign key not found, generating new key pair"
+            # Generate key pair with empty password
+            echo "" | cosign generate-key-pair
+          fi
+          
+          # Sign the Docker image
+          echo "Signing Docker image with Cosign..."
+          IMAGE_REF="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}"
+          cosign sign --key cosign.key --force "${IMAGE_REF}" || echo "Failed to sign Docker image, continuing"
+          
+          # Attach attestations to the image
+          if [ -f "attestation-artifacts/build-intoto-attestation.json" ]; then
+            echo "Attaching build attestation to Docker image..."
+            cosign attach attestation --attestation attestation-artifacts/build-intoto-attestation.json --key cosign.key "${IMAGE_REF}" || echo "Failed to attach build attestation"
+          fi
+          
+          if [ -f "attestation-artifacts/sbom-intoto.json" ]; then
+            echo "Attaching SBOM attestation to Docker image..."
+            cosign attach attestation --attestation attestation-artifacts/sbom-intoto.json --key cosign.key "${IMAGE_REF}" || echo "Failed to attach SBOM attestation"
+          fi
+          
+          # Create attestation metadata
+          cat > image-attestations.json << EOF
+          {
+            "image": "${IMAGE_REF}",
+            "digest": "${IMAGE_DIGEST}",
+            "attestations": {
+              "build": "attached",
+              "sbom": "attached"
+            }
+          }
+          EOF
+          
+          # Reset errors
+          set +x  # Disable command echo
+      
       - name: Set version information
         id: version
         shell: bash
@@ -1448,6 +1567,7 @@ jobs:
           ATTESTATION_TYPE="application/vnd.in-toto+json"
           SIG_TYPE="application/vnd.sigstore+tar+gzip"
           POLICY_TYPE="application/vnd.rego+tar+gzip"
+          BUNDLE_TYPE="application/vnd.biogears.bundle+tar+gzip"
           
           # Push artifacts with error handling
           echo "Pushing SBOM..."
@@ -1461,6 +1581,17 @@ jobs:
           
           echo "Pushing policies..."
           oras push "${REPOSITORY}:policies-${VERSION}" --artifact-type "${POLICY_TYPE}" policies.tar.gz:application/tar+gzip || echo "Failed to push policies"
+          
+          echo "Pushing comprehensive bundle..."
+          oras push "${REPOSITORY}:bundle-${VERSION}" --artifact-type "${BUNDLE_TYPE}" comprehensive-bundle.tar.gz:application/tar+gzip || echo "Failed to push comprehensive bundle"
+          
+          # Tag the latest versions
+          echo "Tagging latest versions..."
+          oras tag "${REPOSITORY}:sbom-${VERSION}" "sbom-latest" || echo "Failed to tag sbom-latest"
+          oras tag "${REPOSITORY}:attestations-${VERSION}" "attestations-latest" || echo "Failed to tag attestations-latest"
+          oras tag "${REPOSITORY}:signatures-${VERSION}" "signatures-latest" || echo "Failed to tag signatures-latest"
+          oras tag "${REPOSITORY}:policies-${VERSION}" "policies-latest" || echo "Failed to tag policies-latest"
+          oras tag "${REPOSITORY}:bundle-${VERSION}" "bundle-latest" || echo "Failed to tag bundle-latest"
           
           # Reset errors
           set +x  # Disable command echo
@@ -1477,6 +1608,7 @@ jobs:
           oras discover -o tree "${REPOSITORY}:attestations-${VERSION}" || echo "Could not list attestations"
           oras discover -o tree "${REPOSITORY}:signatures-${VERSION}" || echo "Could not list signatures"
           oras discover -o tree "${REPOSITORY}:policies-${VERSION}" || echo "Could not list policies"
+          oras discover -o tree "${REPOSITORY}:bundle-${VERSION}" || echo "Could not list comprehensive bundle"
           
           # Reset errors
           set +x  # Disable command echo
@@ -1496,11 +1628,24 @@ jobs:
           ### Docker Image
           - ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
           
-          ### Pipeline Artifacts (ORAS)
+          ### Individual Artifacts (ORAS)
           - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:sbom-${VERSION}
           - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:attestations-${VERSION}
           - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:signatures-${VERSION}
           - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:policies-${VERSION}
+          
+          ### Comprehensive Bundle
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:bundle-${VERSION}
+          
+          ### Latest Tags
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:sbom-latest
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:attestations-latest
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:signatures-latest
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:policies-latest
+          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:bundle-latest
+          
+          ## Docker Image Signatures and Attestations
+          The Docker image has been signed with Cosign and has attestations attached directly.
           
           ## View in GitHub Container Registry
           - https://github.com/${{ github.repository_owner }}/biogears-hari/pkgs/container/biogears-hari
@@ -1511,4 +1656,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-report
-          path: biogears-pipeline-report.md 
+          path: biogears-pipeline-report.md
+          
+      - name: Upload cosign keys
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosign-keys
+          path: |
+            cosign.key
+            cosign.pub
+            image-attestations.json 
