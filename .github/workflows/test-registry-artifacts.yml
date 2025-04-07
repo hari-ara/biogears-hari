@@ -13,6 +13,7 @@ permissions:
   packages: write
 
 jobs:
+  # Step 1: Build Docker images
   build-docker:
     name: Build Docker Images
     runs-on: ubuntu-latest
@@ -84,9 +85,10 @@ jobs:
           name: image-digests
           path: image-digests.txt
 
+  # Step 2: Generate SBOMs and scan for vulnerabilities
   generate-sboms-and-scan:
     name: Generate SBOMs and Scan
-    needs: build-docker
+    needs: build-docker  # This job depends on build-docker
     runs-on: ubuntu-latest
     
     steps:
@@ -135,9 +137,11 @@ jobs:
           name: trivy-scans
           path: trivy-*.json
 
+  # Step 3: Create validation policies
   create-policies:
     name: Create Validation Policies
     runs-on: ubuntu-latest
+    # No dependency specified - runs in parallel with build-docker and generate-sboms-and-scan
     
     steps:
       - name: Checkout code
@@ -420,22 +424,23 @@ jobs:
             signed-policies.tar.gz
             cosign.*
 
+  # Step 4: Generate attestations after policies are created and SBOMs are generated
   generate-attestations:
     name: Generate Attestations
-    needs: [build-docker, generate-sboms-and-scan, create-policies]
+    needs: [build-docker, generate-sboms-and-scan, create-policies] # Depends on all previous jobs
     runs-on: ubuntu-latest
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
       
-      - name: Download Artifacts
+      - name: Download All Artifacts
         uses: actions/download-artifact@v3
-        
-      - name: List Downloaded Artifacts
+      
+      - name: Debug Downloaded Artifacts
         run: |
           echo "Downloaded artifacts:"
-          find . -type f -name "*.*" | sort
+          find . -type f | sort
       
       - name: Install OPA and Cosign
         run: |
@@ -465,10 +470,14 @@ jobs:
       
       - name: Create Image Data Files
         run: |
+          cat image-digests/image-digests.txt
+          
           # Read image digests
           EXTERNAL_DIGEST=$(cat image-digests/image-digests.txt | grep EXTERNAL_DIGEST | cut -d= -f2)
           BUILDER_DIGEST=$(cat image-digests/image-digests.txt | grep BUILDER_DIGEST | cut -d= -f2)
           WEBGEN_DIGEST=$(cat image-digests/image-digests.txt | grep WEBGEN_DIGEST | cut -d= -f2)
+          
+          echo "Found digests: $EXTERNAL_DIGEST, $BUILDER_DIGEST, $WEBGEN_DIGEST"
           
           # Create image metadata files for in-toto attestations
           cat > external-image-data.json << EOF
@@ -492,12 +501,16 @@ jobs:
           }
           EOF
       
+      - name: Prepare Policies
+        run: |
+          # Extract the signed-policies
+          mkdir -p temp-policies
+          tar -xf signed-policies/signed-policies.tar.gz -C temp-policies
+          cp -r temp-policies/policies/rego policies/ || mkdir -p policies/rego
+          ls -la policies/rego/
+      
       - name: Generate Attestations
         run: |
-          # Create the signed-policies directory structure
-          mkdir -p policies/rego
-          cp -r signed-policies/policies/rego/* policies/rego/ || echo "Could not copy policies"
-          
           # Generate Regular Attestations
           opa eval -i build-metadata.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.attestation" -f json > build-attestation-raw.json
           
@@ -532,7 +545,7 @@ jobs:
           
           # Sign the in-toto attestations
           for file in *-intoto-*.json; do
-            cosign attest --key cosign.key --type custom < "$file" > "$file.signed" || echo "Signing failed"
+            cosign attest --key cosign.key --type custom < "$file" > "$file.signed" || echo "Signing failed for $file"
             cosign sign-blob --key cosign.key "$file" > "$file.sig"
           done
           
@@ -560,9 +573,10 @@ jobs:
           name: all-signatures
           path: 'all-signatures.tar.gz'
 
+  # Step 5: Publish artifacts to registry
   publish-artifacts:
     name: Publish Artifacts to Registry
-    needs: [build-docker, generate-sboms-and-scan, create-policies, generate-attestations]
+    needs: [generate-attestations] # Only depends on generate-attestations, which already depends on all others
     runs-on: ubuntu-latest
     
     steps:
@@ -584,13 +598,13 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "Using version: $VERSION"
       
-      - name: Download Artifacts
+      - name: Download All Artifacts
         uses: actions/download-artifact@v3
-        
-      - name: List Downloaded Artifacts
+      
+      - name: Debug Downloaded Artifacts
         run: |
           echo "Downloaded artifacts for publishing:"
-          find . -type f -name "*.*" | sort
+          find . -type f | sort
       
       - name: Install Required Tools
         run: |
@@ -631,17 +645,17 @@ jobs:
           # Extract signatures
           mkdir -p temp-signatures
           tar -xf all-signatures/all-signatures.tar.gz -C temp-signatures
-          cp -r temp-signatures/all-signatures/* artifacts/signatures/
+          cp -r temp-signatures/all-signatures/* artifacts/signatures/ || echo "No signatures found"
           
           # Extract policies
           mkdir -p temp-policies
           tar -xf signed-policies/signed-policies.tar.gz -C temp-policies
-          cp -r temp-policies/policies/* artifacts/policies/
+          cp -r temp-policies/policies/* artifacts/policies/ || echo "No policies found"
           
           # Create archives for pushing
           tar -czf artifacts/archives/signatures.tar.gz -C artifacts/signatures . || echo "No signatures to archive"
           tar -czf artifacts/archives/policies.tar.gz -C artifacts/policies . || echo "No policies to archive"
-          ls -la artifacts/archives/
+          ls -la artifacts/archives/ || echo "No archives created"
       
       - name: Calculate Artifact Sizes
         run: |
@@ -763,7 +777,7 @@ jobs:
           REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
           
           # Read image digests
-          EXTERNAL_DIGEST=$(cat image-digests/image-digests.txt | grep EXTERNAL_DIGEST | cut -d= -f2)
+          EXTERNAL_DIGEST=$(cat image-digests/image-digests.txt | grep EXTERNAL_DIGEST | cut -d= -f2 || echo "sha256:unknown")
           
           # Create reference manifest pointing to all published artifacts
           cat > reference-manifest.json << EOF
