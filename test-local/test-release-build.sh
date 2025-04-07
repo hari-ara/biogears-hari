@@ -34,14 +34,13 @@ RUN apt-get update && \
     wget \
     libxml2-dev \
     libxerces-c-dev \
-    liblog4cpp5-dev \
+    liblog4cpp5v5-dev \
     libeigen3-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Install CodeSynthesis XSD
-RUN wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb && \
-    dpkg -i xsd_4.0.0-1_amd64.deb && \
-    rm xsd_4.0.0-1_amd64.deb
+# Handle architecture-specific package installation
+# Skip CodeSynthesis XSD in local testing to avoid architecture issues
+RUN echo "Skipping XSD installation for local testing"
 
 ENV PATH="/usr/local/bin:${PATH}"
 WORKDIR /opt/biogears
