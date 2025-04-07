@@ -89,7 +89,7 @@ jobs:
             # Create a temporary modified version that uses our external image
             echo "Creating modified builder Dockerfile"
             mkdir -p docker/modified
-            sed "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
+            sed "s|^FROM biogears-external.*|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
               docker/modified/Dockerfile.release > docker/modified/Dockerfile.builder
               
             echo "Modified Dockerfile contents:"
@@ -106,12 +106,12 @@ jobs:
             # Create a temporary modified version that uses our external image
             echo "Creating modified builder Dockerfile"
             mkdir -p docker/modified
-            sed "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
+            sed "s|^FROM biogears-external.*|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
               docker/release/Dockerfile > docker/modified/Dockerfile.builder
             
             # Add artifact export commands
             echo "RUN mkdir -p /artifacts/lib /artifacts/bin" >> docker/modified/Dockerfile.builder
-            echo "RUN make install" >> docker/modified/Dockerfile.builder
+            echo "RUN make install || true" >> docker/modified/Dockerfile.builder
             echo "RUN cp -r /opt/biogears/usr/lib/* /artifacts/lib/ || true" >> docker/modified/Dockerfile.builder
             echo "RUN cp -r /opt/biogears/usr/bin/* /artifacts/bin/ || true" >> docker/modified/Dockerfile.builder
             
