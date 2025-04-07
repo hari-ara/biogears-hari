@@ -95,6 +95,25 @@ jobs:
             echo "Modified Dockerfile contents:"
             cat docker/modified/Dockerfile.builder
             
+            # Add build preparation and debugging commands
+            echo "# Create artifacts directory for outputs" >> docker/modified/Dockerfile.builder
+            echo "RUN mkdir -p /artifacts/lib /artifacts/bin" >> docker/modified/Dockerfile.builder
+            
+            # Add directory setup commands before the build
+            echo "# Ensure schema directories exist with proper permissions" >> docker/modified/Dockerfile.builder
+            echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm" >> docker/modified/Dockerfile.builder
+            echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/c_encoded/8.0.0/biogears/io/xsd/cdm" >> docker/modified/Dockerfile.builder
+            echo "RUN chmod -R 777 /opt/biogears/core/build/projects/biogears/generated" >> docker/modified/Dockerfile.builder
+            
+            # Add debugging commands to verify directory permissions
+            echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
+            echo "RUN touch /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm/TestReport.hxx && echo 'Test file created successfully'" >> docker/modified/Dockerfile.builder
+            
+            # Add the make and artifact collection commands
+            echo "RUN make install || true" >> docker/modified/Dockerfile.builder
+            echo "RUN cp -r /opt/biogears/usr/lib/* /artifacts/lib/ || true" >> docker/modified/Dockerfile.builder
+            echo "RUN cp -r /opt/biogears/usr/bin/* /artifacts/bin/ || true" >> docker/modified/Dockerfile.builder
+            
             # Build with the modified project Dockerfile
             echo "Building BioGears using modified project Dockerfile..."
             docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
@@ -109,8 +128,21 @@ jobs:
             sed "s|^FROM biogears-external.*|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
               docker/release/Dockerfile > docker/modified/Dockerfile.builder
             
-            # Add artifact export commands
+            # Add build preparation and debugging commands
+            echo "# Create artifacts directory for outputs" >> docker/modified/Dockerfile.builder
             echo "RUN mkdir -p /artifacts/lib /artifacts/bin" >> docker/modified/Dockerfile.builder
+            
+            # Add directory setup commands before the build
+            echo "# Ensure schema directories exist with proper permissions" >> docker/modified/Dockerfile.builder
+            echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm" >> docker/modified/Dockerfile.builder
+            echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/c_encoded/8.0.0/biogears/io/xsd/cdm" >> docker/modified/Dockerfile.builder
+            echo "RUN chmod -R 777 /opt/biogears/core/build/projects/biogears/generated" >> docker/modified/Dockerfile.builder
+            
+            # Add debugging commands to verify directory permissions
+            echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
+            echo "RUN touch /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm/TestReport.hxx && echo 'Test file created successfully'" >> docker/modified/Dockerfile.builder
+            
+            # Add the make and artifact collection commands
             echo "RUN make install || true" >> docker/modified/Dockerfile.builder
             echo "RUN cp -r /opt/biogears/usr/lib/* /artifacts/lib/ || true" >> docker/modified/Dockerfile.builder
             echo "RUN cp -r /opt/biogears/usr/bin/* /artifacts/bin/ || true" >> docker/modified/Dockerfile.builder
