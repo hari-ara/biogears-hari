@@ -137,59 +137,69 @@ jobs:
       
       - name: Test with BioGears Compose File
         run: |
+          echo "Testing Docker Compose with BioGears files..."
+          
+          # Always use a test compose file to avoid modifying the original
+          echo "Creating a simplified test compose file for BioGears..."
+          cat > docker-compose-biogears-test.yml << EOF
+          version: "2"
+          
+          services:
+            biogears-external:
+              image: alpine:latest
+              container_name: biogears-external-test
+              command: ["sh", "-c", "echo 'BioGears external test' && sleep 5"]
+              
+            biogears-builder:
+              image: alpine:latest
+              container_name: biogears-builder-test
+              command: ["sh", "-c", "echo 'BioGears builder test' && sleep 5"]
+          EOF
+          
+          # Test the created file with Docker Compose V2
+          echo "Testing with Docker Compose V2..."
+          echo "Compose file content:"
+          cat docker-compose-biogears-test.yml
+          
+          echo "Validating config:"
+          docker compose -f docker-compose-biogears-test.yml config || echo "Failed to validate config with Docker Compose V2"
+          
+          echo "Testing Docker Compose V2 up/down:"
+          docker compose -f docker-compose-biogears-test.yml up -d || echo "Failed to start containers with Docker Compose V2"
+          sleep 5
+          docker compose -f docker-compose-biogears-test.yml logs || echo "Failed to get logs with Docker Compose V2"
+          docker compose -f docker-compose-biogears-test.yml down || echo "Failed to stop containers with Docker Compose V2"
+          
+          # Test with Docker Compose V1
+          echo "Testing with Docker Compose V1..."
+          docker-compose -f docker-compose-biogears-test.yml config || echo "Failed to validate config with Docker Compose V1"
+          docker-compose -f docker-compose-biogears-test.yml up -d || echo "Failed to start containers with Docker Compose V1"
+          sleep 5
+          docker-compose -f docker-compose-biogears-test.yml logs || echo "Failed to get logs with Docker Compose V1"
+          docker-compose -f docker-compose-biogears-test.yml down || echo "Failed to stop containers with Docker Compose V1"
+          
+          # If the original docker-compose.yml exists, just check its syntax without modifying it
           if [ -f "docker-compose.yml" ]; then
-            echo "Testing with actual BioGears docker-compose.yml..."
+            echo "Testing original docker-compose.yml config (without modification):"
+            echo "Content:"
+            cat docker-compose.yml
             
-            # Make a backup of the original file
-            cp docker-compose.yml docker-compose.yml.original
+            echo "Validating with Docker Compose V2:"
+            docker compose -f docker-compose.yml config --services || echo "Failed to validate original file with Docker Compose V2"
             
-            # Modify to use publicly available images for testing
-            sed -i 's|image: biogears-external|image: alpine:latest|g' docker-compose.yml
-            sed -i 's|image: biogears-builder|image: alpine:latest|g' docker-compose.yml
-            sed -i 's|image: biogears-webgen|image: alpine:latest|g' docker-compose.yml
-            
-            # List services with Docker Compose V2
-            echo "Available services (V2):"
-            docker compose config --services || echo "Unable to list services with Docker Compose V2"
-            
-            # List services with Docker Compose V1
-            echo "Available services (V1):"
-            docker-compose config --services || echo "Unable to list services with Docker Compose V1"
-            
-            # Restore the original file
-            mv docker-compose.yml.original docker-compose.yml
-          else
-            echo "No docker-compose.yml found, creating test file..."
-            
-            # Create a test compose file based on what we know
-            cat > docker-compose-biogears.yml << EOF
-            version: "2"
-            
-            services:
-              biogears-external:
-                image: alpine:latest
-                container_name: biogears-external-test
-                command: ["sh", "-c", "echo 'BioGears external test' && sleep 2"]
-            EOF
-            
-            # Test the created file
-            echo "Testing with created docker-compose-biogears.yml"
-            docker compose -f docker-compose-biogears.yml config || echo "Failed to parse config with Docker Compose V2"
-            docker-compose -f docker-compose-biogears.yml config || echo "Failed to parse config with Docker Compose V1"
+            echo "Validating with Docker Compose V1:"
+            docker-compose -f docker-compose.yml config --services || echo "Failed to validate original file with Docker Compose V1"
           fi
       
       - name: Build External Image (if possible)
         run: |
           if [ -d "docker/external" ] && [ -f "docker/external/Dockerfile" ]; then
+            echo "Inspecting Dockerfile content:"
+            cat docker/external/Dockerfile
+            
             echo "Building external image with Docker..."
             # Use --progress=plain for better debugging output
             docker build -t biogears-external-test --progress=plain docker/external || echo "Failed to build with Docker"
-            
-            if [ -f "docker-compose.yml" ]; then
-              echo "Testing docker-compose build command..."
-              # Instead of actually building, just check if the command parses correctly
-              docker-compose -f docker-compose.yml config || echo "Failed to parse docker-compose.yml"
-            fi
           else
             echo "External Dockerfile not found, skipping build test"
           fi
@@ -200,6 +210,7 @@ jobs:
           echo "Cleaning up test containers..."
           docker rm -f alpine-test || true
           docker rm -f biogears-external-test || true
+          docker rm -f biogears-builder-test || true
           docker rmi biogears-external-test || true
           
           echo "Test completed" 
