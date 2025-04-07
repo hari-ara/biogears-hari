@@ -29,21 +29,53 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential liblog4cpp5-dev libxerces-c-dev libeigen3-dev wget
+          sudo apt-get install -y cmake build-essential liblog4cpp5-dev libxerces-c-dev libeigen3-dev wget \
+            git gcc g++ make cmake pkg-config libtool autoconf valgrind \
+            ninja-build ccache libboost-all-dev doxygen graphviz
+          
+          # Check installed dependency versions
+          echo "===== DEPENDENCY VERSIONS ====="
+          g++ --version
+          cmake --version
+          pkg-config --version
+          echo "===== LIBRARY VERSIONS ====="
+          pkg-config --modversion eigen3 || echo "eigen3.pc not found"
+          pkg-config --modversion xerces-c || echo "xerces-c.pc not found"
+          pkg-config --modversion log4cpp || echo "log4cpp.pc not found"
+          
           # Install CodeSynthesis XSD
+          echo "===== INSTALLING CODESYNTHESIS XSD ====="
           wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb
           sudo dpkg -i xsd_4.0.0-1_amd64.deb
+          xsd --version || echo "xsd not properly installed"
+          
+          # Check directory structure
+          echo "===== DIRECTORY STRUCTURE ====="
+          ls -la
       
       - name: Configure CMake
         run: |
           mkdir -p build
           cd build
-          cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_VERBOSE_MAKEFILE=ON
       
       - name: Build BioGears
         run: |
           cd build
-          cmake --build . --parallel $(nproc)
+          echo "Processor count: $(nproc)"
+          echo "CMake version: $(cmake --version)"
+          echo "GCC version: $(gcc --version)"
+          echo "Build directory contents:"
+          ls -la
+          # Build with more verbose output and show where it fails
+          cmake --build . --parallel $(nproc) --verbose || { 
+            echo "===== BUILD FAILED ====="
+            echo "Last 100 lines of CMakeFiles/CMakeError.log:"
+            tail -n 100 CMakeFiles/CMakeError.log || echo "No CMakeError.log found"
+            echo "===== DETAILED ENVIRONMENT INFO ====="
+            env | sort
+            exit 1
+          }
       
       - name: Create build metadata
         run: |
