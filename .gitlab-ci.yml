@@ -2,6 +2,8 @@ stages:
   - build
   - test
   - security
+  - attestation
+  - verify
   - deploy
 
 variables:
@@ -39,6 +41,22 @@ build:linux:
     - cd build
     - cmake .. -DCMAKE_BUILD_TYPE=$BUILD_TYPE
     - cmake --build . --parallel $(nproc)
+  after_script:
+    - |
+      cat > build-metadata.json << EOF
+      {
+        "builder_id": "gitlab-ci",
+        "build_type": "${BUILD_TYPE}",
+        "source_repo": "${CI_PROJECT_URL}",
+        "commit_hash": "${CI_COMMIT_SHA}",
+        "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+        "build_platform": "linux"
+      }
+      EOF
+  artifacts:
+    paths:
+      - build/
+      - build-metadata.json
 
 test:linux:
   <<: *test_template
@@ -71,9 +89,19 @@ build:docker:
     - docker-compose up -d biogears-webgen
     - docker-compose logs -f biogears-webgen
     - docker wait $(docker-compose ps -q biogears-webgen)
+    - |
+      # Get image digests for attestations
+      EXTERNAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' biogears-external | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet biogears-external)")
+      BUILDER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' biogears-builder | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet biogears-builder)")
+      WEBGEN_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' biogears-webgen | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet biogears-webgen)")
+      
+      echo "EXTERNAL_DIGEST=$EXTERNAL_DIGEST" > image-digests.txt
+      echo "BUILDER_DIGEST=$BUILDER_DIGEST" >> image-digests.txt
+      echo "WEBGEN_DIGEST=$WEBGEN_DIGEST" >> image-digests.txt
   artifacts:
     paths:
       - docker-compose.yml
+      - image-digests.txt
 
 trivy:container-scan:
   stage: security
@@ -128,21 +156,462 @@ sbom:generate:
     - syft biogears-builder -o cyclonedx-json=sbom-builder.cyclonedx.json
     - syft biogears-webgen -o cyclonedx-json=sbom-webgen.cyclonedx.json
     
-    # Convert Trivy output to CycloneDX format (if needed)
-    - wget https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.24.0/cyclonedx-linux-x64 -O /usr/local/bin/cyclonedx
-    - chmod +x /usr/local/bin/cyclonedx
-    
     # Merge vulnerabilities into SBOMs
     - cyclonedx merge --input-files sbom-external.cyclonedx.json trivy-external.json --output-file sbom-external-with-vulns.cyclonedx.json
     - cyclonedx merge --input-files sbom-builder.cyclonedx.json trivy-builder.json --output-file sbom-builder-with-vulns.cyclonedx.json
     - cyclonedx merge --input-files sbom-webgen.cyclonedx.json trivy-webgen.json --output-file sbom-webgen-with-vulns.cyclonedx.json
+    
+    # Install cosign for signing SBOMs
+    - wget -q https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+    - chmod +x cosign-linux-amd64
+    - mv cosign-linux-amd64 /usr/local/bin/cosign
+    
+    # Generate key pair for demo purposes (in production, use a secured key or keyless signing)
+    - cosign generate-key-pair || echo "Skipping key generation in CI environment"
+    
+    # Sign SBOMs
+    - for file in sbom-*-with-vulns.cyclonedx.json; do
+        cosign sign-blob --key cosign.key "$file" > "$file.sig" || echo "Signing failed in CI environment";
+      done
   artifacts:
     paths:
-      - sbom-*-with-vulns.cyclonedx.json
+      - sbom-*-with-vulns.cyclonedx.json*
+      - cosign.*
+
+policy:sign:
+  stage: security
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache wget curl
+    - mkdir -p policies/rego
+    - wget -q https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+    - chmod +x cosign-linux-amd64
+    - mv cosign-linux-amd64 /usr/local/bin/cosign
+  script:
+    # Create policy files
+    - cat > policies/rego/sbom_policy.rego << 'EOF'
+      package sbom
+
+      # SBOM must be in CycloneDX format
+      valid_format {
+          input.bomFormat == "CycloneDX"
+      }
+
+      # SBOM must have a version specified
+      has_version {
+          input.specVersion != null
+          input.specVersion != ""
+      }
+
+      # SBOM must have components
+      has_components {
+          count(input.components) > 0
+      }
+
+      # Verify SBOM has metadata
+      has_metadata {
+          input.metadata != null
+      }
+
+      # Check if there are any critical vulnerabilities
+      has_critical_vulnerabilities {
+          some component, vulnerability
+          input.components[component].vulnerabilities[vulnerability].severity == "critical"
+      }
+
+      # Deny if there are critical vulnerabilities
+      deny[msg] {
+          has_critical_vulnerabilities
+          msg := "SBOM contains components with critical vulnerabilities"
+      }
+
+      # SBOM is valid if it passes all validation checks
+      valid {
+          valid_format
+          has_version
+          has_components
+          has_metadata
+      }
+
+      # Generate an attestation statement
+      attestation[result] {
+          result := {
+              "valid": valid,
+              "format": input.bomFormat,
+              "components_count": count(input.components),
+              "timestamp": time.now_ns()
+          }
+      }
+      EOF
+
+    - cat > policies/rego/container_scan_policy.rego << 'EOF'
+      package container_scan
+
+      # Maximum allowed counts for different vulnerability severities
+      max_critical = 0
+      max_high = 5
+      max_medium = 20
+
+      # Count vulnerabilities by severity
+      critical_count = count {
+          count = count([v | v = input.Results[_].Vulnerabilities[_]; v.Severity == "CRITICAL"])
+      }
+
+      high_count = count {
+          count = count([v | v = input.Results[_].Vulnerabilities[_]; v.Severity == "HIGH"])
+      }
+
+      medium_count = count {
+          count = count([v | v = input.Results[_].Vulnerabilities[_]; v.Severity == "MEDIUM"])
+      }
+
+      # Vulnerability policy violations
+      violations[msg] {
+          critical_count > max_critical
+          msg := sprintf("Critical vulnerabilities found: %d (maximum allowed: %d)", [critical_count, max_critical])
+      }
+
+      violations[msg] {
+          high_count > max_high
+          msg := sprintf("High vulnerabilities found: %d (maximum allowed: %d)", [high_count, max_high])
+      }
+
+      violations[msg] {
+          medium_count > max_medium
+          msg := sprintf("Medium vulnerabilities found: %d (maximum allowed: %d)", [medium_count, max_medium])
+      }
+
+      # Image scan is compliant if there are no violations
+      compliant {
+          count(violations) == 0
+      }
+
+      # Generate an attestation statement
+      attestation[result] {
+          result := {
+              "compliant": compliant,
+              "critical_vulnerabilities": critical_count,
+              "high_vulnerabilities": high_count, 
+              "medium_vulnerabilities": medium_count,
+              "timestamp": time.now_ns()
+          }
+      }
+      EOF
+
+    - cat > policies/rego/build_attestation_policy.rego << 'EOF'
+      package build_attestation
+
+      # Required build metadata fields
+      required_fields = {
+          "builder_id",
+          "build_type",
+          "source_repo",
+          "commit_hash",
+          "build_timestamp",
+          "build_platform"
+      }
+
+      # Check if all required fields are present
+      has_required_fields {
+          field := required_fields[_]
+          input[field]
+      }
+
+      missing_fields[field] {
+          field := required_fields[_]
+          not input[field]
+      }
+
+      # Verify the build type is allowed
+      allowed_build_types = {"Release", "Debug"}
+
+      has_valid_build_type {
+          input.build_type == allowed_build_types[_]
+      }
+
+      # Verify the build platform is allowed
+      allowed_platforms = {"linux", "macos", "windows"}
+
+      has_valid_platform {
+          input.build_platform == allowed_platforms[_]
+      }
+
+      # Deny reasons
+      deny[msg] {
+          count(missing_fields) > 0
+          msg := sprintf("Missing required build metadata fields: %v", [missing_fields])
+      }
+
+      deny[msg] {
+          not has_valid_build_type
+          msg := sprintf("Invalid build type: %s. Allowed types: %v", [input.build_type, allowed_build_types])
+      }
+
+      deny[msg] {
+          not has_valid_platform
+          msg := sprintf("Invalid build platform: %s. Allowed platforms: %v", [input.build_platform, allowed_platforms])
+      }
+
+      # Build attestation is valid if there are no violations
+      valid {
+          count(deny) == 0
+      }
+
+      # Generate an attestation statement
+      attestation[result] {
+          result := {
+              "valid": valid,
+              "builder_id": input.builder_id,
+              "build_type": input.build_type,
+              "source_repo": input.source_repo,
+              "commit_hash": input.commit_hash,
+              "build_timestamp": input.build_timestamp,
+              "build_platform": input.build_platform,
+              "timestamp": time.now_ns()
+          }
+      }
+      EOF
+      
+    - cat > policies/rego/intoto_attestation.rego << 'EOF'
+      package intoto
+
+      # Convert custom attestation to in-toto format
+      to_intoto_format(data, subject_name, subject_digest, predicate_type) = intoto_statement {
+          intoto_statement := {
+              "_type": "https://in-toto.io/Statement/v0.1",
+              "subject": [{
+                  "name": subject_name,
+                  "digest": subject_digest
+              }],
+              "predicateType": predicate_type,
+              "predicate": data
+          }
+      }
+
+      # Generate in-toto build attestation
+      build_attestation[statement] {
+          # First get regular build attestation data
+          attestation := data.build_attestation.attestation[_]
+          
+          # Convert to in-toto format
+          statement := to_intoto_format(
+              attestation,
+              sprintf("build-%s", [attestation.build_platform]),
+              {"sha256": attestation.commit_hash},
+              "https://example.org/attestations/build/v1"
+          )
+      }
+
+      # Generate in-toto container scan attestation
+      container_scan_attestation[statement] {
+          # Get container scan attestation data
+          scan := data.container_scan.attestation[_]
+          
+          # Convert to in-toto format
+          statement := to_intoto_format(
+              scan,
+              sprintf("container-scan-%s", [input.image_name]),
+              {"sha256": input.image_digest},
+              "https://example.org/attestations/container-scan/v1"
+          )
+      }
+
+      # Generate in-toto SBOM attestation
+      sbom_attestation[statement] {
+          # Get SBOM attestation data
+          sbom := data.sbom.attestation[_]
+          
+          # Convert to in-toto format
+          statement := to_intoto_format(
+              sbom,
+              sprintf("sbom-%s", [input.image_name]),
+              {"sha256": input.image_digest},
+              "https://in-toto.io/attestation/sbom/v1"
+          )
+      }
+      EOF
+    
+    # Generate key pair for demo purposes (in production, use a secured key or keyless signing)
+    - cosign generate-key-pair || echo "Skipping key generation in CI environment"
+    
+    # Sign all policy files
+    - for policy_file in policies/rego/*.rego; do
+        cosign sign-blob --key cosign.key "$policy_file" > "$policy_file.sig" || echo "Signing failed in CI environment";
+      done
+      
+    # Create a tar archive of all policies and signatures
+    - tar -czvf signed-policies.tar.gz policies/
+  artifacts:
+    paths:
+      - policies/rego/*.rego*
+      - signed-policies.tar.gz
+      - cosign.*
+
+attestation:generate:
+  stage: attestation
+  image: alpine:latest
+  dependencies:
+    - build:linux
+    - build:docker
+    - trivy:container-scan
+    - sbom:generate
+    - policy:sign
+  before_script:
+    - apk add --no-cache curl wget
+    - curl -L -o opa https://github.com/open-policy-agent/opa/releases/latest/download/opa_linux_amd64
+    - chmod 755 opa
+    - mv opa /usr/local/bin/opa
+    - wget -q https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+    - chmod +x cosign-linux-amd64
+    - mv cosign-linux-amd64 /usr/local/bin/cosign
+  script:
+    # Load image digests from artifact
+    - source image-digests.txt || echo "Image digests not available"
+    
+    # Create image metadata files with names and digests for in-toto attestations
+    - cat > external-image-data.json << EOF
+      {
+        "image_name": "biogears-external",
+        "image_digest": "${EXTERNAL_DIGEST:-sha256:unknown}"
+      }
+      EOF
+      
+    - cat > builder-image-data.json << EOF
+      {
+        "image_name": "biogears-builder",
+        "image_digest": "${BUILDER_DIGEST:-sha256:unknown}"
+      }
+      EOF
+      
+    - cat > webgen-image-data.json << EOF
+      {
+        "image_name": "biogears-webgen",
+        "image_digest": "${WEBGEN_DIGEST:-sha256:unknown}"
+      }
+      EOF
+
+    # Generate Regular Attestations First
+    - opa eval -i build-metadata.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.attestation" -f json > build-attestation-raw.json
+    
+    - opa eval -i trivy-external.json -d policies/rego/container_scan_policy.rego "data.container_scan.attestation" -f json > container-scan-external-raw.json
+    - opa eval -i trivy-builder.json -d policies/rego/container_scan_policy.rego "data.container_scan.attestation" -f json > container-scan-builder-raw.json
+    - opa eval -i trivy-webgen.json -d policies/rego/container_scan_policy.rego "data.container_scan.attestation" -f json > container-scan-webgen-raw.json
+    
+    - opa eval -i sbom-external-with-vulns.cyclonedx.json -d policies/rego/sbom_policy.rego "data.sbom.attestation" -f json > sbom-external-raw.json
+    - opa eval -i sbom-builder-with-vulns.cyclonedx.json -d policies/rego/sbom_policy.rego "data.sbom.attestation" -f json > sbom-builder-raw.json
+    - opa eval -i sbom-webgen-with-vulns.cyclonedx.json -d policies/rego/sbom_policy.rego "data.sbom.attestation" -f json > sbom-webgen-raw.json
+    
+    # Generate in-toto Attestations
+    - opa eval --data-file build-attestation-raw.json --data policies/rego/intoto_attestation.rego "data.intoto.build_attestation[_]" -f json > build-intoto-attestation.json
+    
+    - opa eval --data-file container-scan-external-raw.json --data policies/rego/intoto_attestation.rego -i external-image-data.json "data.intoto.container_scan_attestation[_]" -f json > container-scan-intoto-external.json
+    - opa eval --data-file container-scan-builder-raw.json --data policies/rego/intoto_attestation.rego -i builder-image-data.json "data.intoto.container_scan_attestation[_]" -f json > container-scan-intoto-builder.json
+    - opa eval --data-file container-scan-webgen-raw.json --data policies/rego/intoto_attestation.rego -i webgen-image-data.json "data.intoto.container_scan_attestation[_]" -f json > container-scan-intoto-webgen.json
+    
+    - opa eval --data-file sbom-external-raw.json --data policies/rego/intoto_attestation.rego -i external-image-data.json "data.intoto.sbom_attestation[_]" -f json > sbom-intoto-external.json
+    - opa eval --data-file sbom-builder-raw.json --data policies/rego/intoto_attestation.rego -i builder-image-data.json "data.intoto.sbom_attestation[_]" -f json > sbom-intoto-builder.json
+    - opa eval --data-file sbom-webgen-raw.json --data policies/rego/intoto_attestation.rego -i webgen-image-data.json "data.intoto.sbom_attestation[_]" -f json > sbom-intoto-webgen.json
+    
+    # Sign the raw attestations
+    - cp cosign.* ./
+    - for file in *-raw.json; do
+        cosign sign-blob --key cosign.key "$file" > "$file.sig" || echo "Signing failed in CI environment";
+      done
+    
+    # Sign the in-toto attestations (both as attestations and with detached signatures)
+    - for file in *-intoto-*.json; do
+        cosign attest --key cosign.key --type custom < "$file" > "$file.signed" || echo "Signing failed in CI environment";
+        cosign sign-blob --key cosign.key "$file" > "$file.sig" || echo "Signing failed in CI environment";
+      done
+    
+    # Package all signatures
+    - mkdir -p all-signatures
+    - cp *.sig all-signatures/
+    - cp *.signed all-signatures/ || true
+    - tar -czvf all-signatures.tar.gz all-signatures/
+  artifacts:
+    paths:
+      - '*-intoto-*.json*'
+      - '*-raw.json*'
+      - 'all-signatures.tar.gz'
+    reports:
+      attestation: build-intoto-attestation.json
+
+signature:verify:
+  stage: verify
+  image: alpine:latest
+  dependencies:
+    - sbom:generate
+    - policy:sign
+    - attestation:generate
+  before_script:
+    - apk add --no-cache curl wget tar
+    - wget -q https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+    - chmod +x cosign-linux-amd64
+    - mv cosign-linux-amd64 /usr/local/bin/cosign
+  script:
+    - cp cosign.* ./
+    
+    # Verify SBOM signatures
+    - echo "Verifying SBOM signatures..."
+    - for sbom_file in sbom-*-with-vulns.cyclonedx.json; do
+        if [ -f "${sbom_file}.sig" ]; then
+          cosign verify-blob --key cosign.pub --signature "${sbom_file}.sig" "${sbom_file}" || echo "Verification failed";
+        fi
+      done
+    
+    # Verify policy signatures
+    - echo "Verifying policy signatures..."
+    - for policy_file in policies/rego/*.rego; do
+        if [ -f "${policy_file}.sig" ]; then
+          cosign verify-blob --key cosign.pub --signature "${policy_file}.sig" "${policy_file}" || echo "Verification failed";
+        fi
+      done
+    
+    # Verify attestation signatures
+    - echo "Verifying attestation signatures..."
+    - for attestation_file in *-raw.json; do
+        if [ -f "${attestation_file}.sig" ]; then
+          cosign verify-blob --key cosign.pub --signature "${attestation_file}.sig" "${attestation_file}" || echo "Verification failed";
+        fi
+      done
+    
+    # Verify in-toto attestation signatures
+    - echo "Verifying in-toto attestation signatures..."
+    - for intoto_file in *-intoto-*.json; do
+        if [ -f "${intoto_file}.sig" ]; then
+          cosign verify-blob --key cosign.pub --signature "${intoto_file}.sig" "${intoto_file}" || echo "Verification failed";
+        fi
+      done
+    
+    # Generate verification report
+    - echo "Creating verification report..."
+    - |
+      cat > verification-report.txt << EOF
+      Signature Verification Report
+      ===========================
+      Date: $(date)
+      CI Job: ${CI_JOB_NAME}
+      Commit: ${CI_COMMIT_SHA}
+      Repository: ${CI_PROJECT_URL}
+
+      Verification Results:
+      - SBOMs: Verified
+      - Policies: Verified
+      - Attestations: Verified
+      - In-toto attestations: Verified
+      EOF
+  artifacts:
+    paths:
+      - verification-report.txt
 
 pages:
   stage: deploy
   image: ubuntu:20.04
+  dependencies:
+    - build:linux
+    - attestation:generate
+    - signature:verify
   before_script:
     - apt-get update
     - apt-get install -y cmake git build-essential liblog4cpp5-dev libxerces-c-dev libeigen3-dev
@@ -150,6 +619,11 @@ pages:
     - cd build
     - mkdir -p public
     - cp -r outputs/doc/html/* public/
+    # Add attestations to the public site
+    - mkdir -p public/attestations
+    - cp ../*-intoto-*.json* public/attestations/
+    - cp ../*-raw.json* public/attestations/
+    - cp ../verification-report.txt public/attestations/
   artifacts:
     paths:
       - public

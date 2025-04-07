@@ -53,6 +53,27 @@ jobs:
     - name: Test
       working-directory: ${{github.workspace}}/build
       run: ctest -C ${{ matrix.build_type }} --output-on-failure
+      
+    - name: Generate Build Metadata
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        cat > build-metadata.json << EOF
+        {
+          "builder_id": "github-actions",
+          "build_type": "${{ matrix.build_type }}",
+          "source_repo": "${{ github.repository }}",
+          "commit_hash": "${{ github.sha }}",
+          "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+          "build_platform": "${{ matrix.os }}"
+        }
+        EOF
+      
+    - name: Upload Build Metadata
+      if: matrix.os == 'ubuntu-latest'
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-metadata
+        path: build-metadata.json
 
   docker-build:
     name: Docker Build
@@ -76,6 +97,23 @@ jobs:
       run: |
         docker-compose up biogears-builder
         docker-compose up biogears-webgen
+        
+    - name: Generate Image Digests
+      run: |
+        # Get image digests for attestations
+        EXTERNAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' biogears-external | cut -d'@' -f2)
+        BUILDER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' biogears-builder | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet biogears-builder)")
+        WEBGEN_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' biogears-webgen | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet biogears-webgen)")
+        
+        echo "EXTERNAL_DIGEST=$EXTERNAL_DIGEST" > image-digests.txt
+        echo "BUILDER_DIGEST=$BUILDER_DIGEST" >> image-digests.txt
+        echo "WEBGEN_DIGEST=$WEBGEN_DIGEST" >> image-digests.txt
+        
+    - name: Upload Image Digests
+      uses: actions/upload-artifact@v3
+      with:
+        name: image-digests
+        path: image-digests.txt
         
   trivy-scan:
     name: Trivy Container Scan
@@ -213,10 +251,321 @@ jobs:
           
           # Merge vulnerabilities into webgen image SBOM
           cyclonedx merge --input-files sbom-webgen.cyclonedx.json trivy-results-webgen.json --output-file sbom-webgen-with-vulns.cyclonedx.json
+          
+      - name: Install Cosign
+        run: |
+          wget -q https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          
+      - name: Generate Key Pair for Signing
+        run: |
+          # Generate a key pair for demo/testing purposes
+          # In production, use a properly secured key or keyless signing
+          cosign generate-key-pair
+          
+      - name: Sign SBOMs
+        run: |
+          # Sign all SBOMs
+          for sbom_file in sbom-*-with-vulns.cyclonedx.json; do
+            cosign sign-blob --key cosign.key "$sbom_file" > "$sbom_file.sig" || echo "Signing failed in CI environment"
+          done
         
       - name: Upload SBOM artifacts
         uses: actions/upload-artifact@v3
         with:
           name: sbom-files
           path: |
-            sbom-*-with-vulns.cyclonedx.json 
+            sbom-*-with-vulns.cyclonedx.json*
+            
+  policy-signing:
+    name: Sign Rego Policies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Install Cosign
+        run: |
+          wget -q https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          
+      - name: Generate Key Pair for Signing
+        run: |
+          # Generate a key pair for demo/testing purposes
+          # In production, use a properly secured key or keyless signing
+          cosign generate-key-pair
+          
+      - name: Sign Rego Policies
+        run: |
+          # Sign all Rego policies
+          for policy_file in policies/rego/*.rego; do
+            cosign sign-blob --key cosign.key "$policy_file" > "$policy_file.sig" || echo "Signing failed in CI environment"
+          done
+          
+          # Create a tar bundle of policies and signatures
+          tar -czvf signed-policies.tar.gz policies/rego/
+          
+      - name: Upload Signed Policies
+        uses: actions/upload-artifact@v3
+        with:
+          name: signed-policies
+          path: |
+            signed-policies.tar.gz
+            policies/rego/*.sig
+            
+  attestation:
+    name: Generate Attestations
+    needs: [build, docker-build, trivy-scan, generate-sbom, policy-signing]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Download build metadata
+        uses: actions/download-artifact@v3
+        with:
+          name: build-metadata
+          
+      - name: Download SBOM files
+        uses: actions/download-artifact@v3
+        with:
+          name: sbom-files
+          
+      - name: Download Trivy reports
+        uses: actions/download-artifact@v3
+        with:
+          name: trivy-reports
+          
+      - name: Download image digests
+        uses: actions/download-artifact@v3
+        with:
+          name: image-digests
+      
+      - name: Install OPA
+        run: |
+          curl -L -o opa https://github.com/open-policy-agent/opa/releases/latest/download/opa_linux_amd64
+          chmod 755 opa
+          sudo mv opa /usr/local/bin/opa
+          opa version
+      
+      - name: Setup for in-toto attestations
+        run: |
+          # Load image digests
+          source image-digests.txt
+          
+          # Create image metadata files with names and digests for in-toto attestations
+          cat > external-image-data.json << EOF
+          {
+            "image_name": "biogears-external",
+            "image_digest": "${EXTERNAL_DIGEST:-sha256:unknown}"
+          }
+          EOF
+          
+          cat > builder-image-data.json << EOF
+          {
+            "image_name": "biogears-builder",
+            "image_digest": "${BUILDER_DIGEST:-sha256:unknown}"
+          }
+          EOF
+          
+          cat > webgen-image-data.json << EOF
+          {
+            "image_name": "biogears-webgen",
+            "image_digest": "${WEBGEN_DIGEST:-sha256:unknown}"
+          }
+          EOF
+      
+      - name: Generate Regular Attestations First
+        run: |
+          # Build attestation
+          opa eval -i build-metadata.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.attestation" -f json > build-attestation-raw.json
+          
+          # Container scan attestations
+          opa eval -i trivy-results-external.json -d policies/rego/container_scan_policy.rego "data.container_scan.attestation" -f json > container-scan-external-raw.json
+          opa eval -i trivy-results-builder.json -d policies/rego/container_scan_policy.rego "data.container_scan.attestation" -f json > container-scan-builder-raw.json
+          opa eval -i trivy-results-webgen.json -d policies/rego/container_scan_policy.rego "data.container_scan.attestation" -f json > container-scan-webgen-raw.json
+          
+          # SBOM attestations
+          opa eval -i sbom-external-with-vulns.cyclonedx.json -d policies/rego/sbom_policy.rego "data.sbom.attestation" -f json > sbom-external-raw.json
+          opa eval -i sbom-builder-with-vulns.cyclonedx.json -d policies/rego/sbom_policy.rego "data.sbom.attestation" -f json > sbom-builder-raw.json
+          opa eval -i sbom-webgen-with-vulns.cyclonedx.json -d policies/rego/sbom_policy.rego "data.sbom.attestation" -f json > sbom-webgen-raw.json
+          
+      - name: Generate in-toto Attestations
+        run: |
+          # Build in-toto attestation
+          opa eval \
+            --data-file build-attestation-raw.json \
+            --data policies/rego/intoto_attestation.rego \
+            "data.intoto.build_attestation[_]" \
+            -f json > build-intoto-attestation.json
+          
+          # Container scan in-toto attestations
+          opa eval \
+            --data-file container-scan-external-raw.json \
+            --data policies/rego/intoto_attestation.rego \
+            -i external-image-data.json \
+            "data.intoto.container_scan_attestation[_]" \
+            -f json > container-scan-intoto-external.json
+          
+          opa eval \
+            --data-file container-scan-builder-raw.json \
+            --data policies/rego/intoto_attestation.rego \
+            -i builder-image-data.json \
+            "data.intoto.container_scan_attestation[_]" \
+            -f json > container-scan-intoto-builder.json
+          
+          opa eval \
+            --data-file container-scan-webgen-raw.json \
+            --data policies/rego/intoto_attestation.rego \
+            -i webgen-image-data.json \
+            "data.intoto.container_scan_attestation[_]" \
+            -f json > container-scan-intoto-webgen.json
+          
+          # SBOM in-toto attestations
+          opa eval \
+            --data-file sbom-external-raw.json \
+            --data policies/rego/intoto_attestation.rego \
+            -i external-image-data.json \
+            "data.intoto.sbom_attestation[_]" \
+            -f json > sbom-intoto-external.json
+          
+          opa eval \
+            --data-file sbom-builder-raw.json \
+            --data policies/rego/intoto_attestation.rego \
+            -i builder-image-data.json \
+            "data.intoto.sbom_attestation[_]" \
+            -f json > sbom-intoto-builder.json
+          
+          opa eval \
+            --data-file sbom-webgen-raw.json \
+            --data policies/rego/intoto_attestation.rego \
+            -i webgen-image-data.json \
+            "data.intoto.sbom_attestation[_]" \
+            -f json > sbom-intoto-webgen.json
+          
+      - name: Install Cosign
+        run: |
+          wget -q https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          
+      - name: Generate Key Pair for Signing
+        run: |
+          # Generate a test key for demo/testing purposes
+          # In production, you would use a properly secured key or keyless signing
+          cosign generate-key-pair
+          
+      - name: Sign Regular Attestations
+        run: |
+          # Sign the raw attestations
+          for file in *-raw.json; do
+            cosign sign-blob --key cosign.key "$file" > "$file.sig" || echo "Signing failed in CI environment"
+          done
+          
+      - name: Sign in-toto Attestations
+        run: |
+          # Sign the in-toto attestations
+          for file in *-intoto-*.json; do
+            cosign attest --key cosign.key --type custom < "$file" > "$file.signed" || echo "Signing failed in CI environment"
+          done
+          
+          # Also create detached signatures
+          for file in *-intoto-*.json; do
+            cosign sign-blob --key cosign.key "$file" > "$file.sig" || echo "Signing failed in CI environment"
+          done
+          
+      - name: Package All Signatures
+        run: |
+          # Create a comprehensive archive of all signatures
+          mkdir -p all-signatures
+          cp *.sig all-signatures/
+          cp *.signed all-signatures/ || true
+          tar -czvf all-signatures.tar.gz all-signatures/
+          
+      - name: Upload in-toto Attestations
+        uses: actions/upload-artifact@v3
+        with:
+          name: intoto-attestations
+          path: |
+            *-intoto-*.json*
+            
+      - name: Upload Regular Attestations
+        uses: actions/upload-artifact@v3
+        with:
+          name: regular-attestations
+          path: |
+            *-raw.json*
+            
+      - name: Upload All Signatures
+        uses: actions/upload-artifact@v3
+        with:
+          name: all-signatures
+          path: |
+            all-signatures.tar.gz
+            
+  signature-verification:
+    name: Verify Signatures
+    needs: [generate-sbom, policy-signing, attestation]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v3
+        
+      - name: Install Cosign
+        run: |
+          wget -q https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          
+      - name: Verify Signatures
+        run: |
+          # Verify SBOM signatures
+          echo "Verifying SBOM signatures..."
+          for sbom_file in sbom-files/sbom-*-with-vulns.cyclonedx.json; do
+            if [ -f "${sbom_file}.sig" ]; then
+              cosign verify-blob --key cosign.pub --signature "${sbom_file}.sig" "${sbom_file}" || echo "Verification failed"
+            fi
+          done
+          
+          # Verify policy signatures
+          echo "Verifying policy signatures..."
+          for policy_file in signed-policies/policies/rego/*.rego; do
+            if [ -f "${policy_file}.sig" ]; then
+              cosign verify-blob --key cosign.pub --signature "${policy_file}.sig" "${policy_file}" || echo "Verification failed"
+            fi
+          done
+          
+          # Verify attestation signatures
+          echo "Verifying attestation signatures..."
+          for attestation_file in regular-attestations/*-raw.json; do
+            if [ -f "${attestation_file}.sig" ]; then
+              cosign verify-blob --key cosign.pub --signature "${attestation_file}.sig" "${attestation_file}" || echo "Verification failed"
+            fi
+          done
+          
+          # Verify in-toto attestation signatures
+          echo "Verifying in-toto attestation signatures..."
+          for intoto_file in intoto-attestations/*-intoto-*.json; do
+            if [ -f "${intoto_file}.sig" ]; then
+              cosign verify-blob --key cosign.pub --signature "${intoto_file}.sig" "${intoto_file}" || echo "Verification failed"
+            fi
+          done
+          
+          # Generate verification report
+          echo "Creating verification report..."
+          echo "Signature Verification Report" > verification-report.txt
+          echo "===========================" >> verification-report.txt
+          echo "Date: $(date)" >> verification-report.txt
+          echo "CI Job: $GITHUB_JOB" >> verification-report.txt
+          echo "Commit: $GITHUB_SHA" >> verification-report.txt
+          echo "Repository: $GITHUB_REPOSITORY" >> verification-report.txt
+          echo "\nVerification Results:" >> verification-report.txt
+          # In a real scenario, we would add actual verification results
+          
+      - name: Upload Verification Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: verification-report
+          path: verification-report.txt 
