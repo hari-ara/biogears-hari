@@ -18,6 +18,9 @@ jobs:
         with:
           fetch-depth: 0
       
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        
       - name: Debug environment
         run: |
           echo "GitHub runner environment info:"
@@ -25,12 +28,12 @@ jobs:
           echo "Docker version:"
           docker --version || echo "Docker not available"
           
-          echo "Docker Compose status:"
+          echo "Docker Compose status - before installation:"
           docker compose version || echo "Docker Compose V2 not available"
           docker-compose --version || echo "Legacy Docker Compose not available"
           
           echo "Content of docker directory:"
-          ls -la docker/
+          ls -la docker/ || echo "Docker directory not found"
           
           echo "Checking for docker-compose.yml:"
           if [ -f "docker-compose.yml" ]; then
@@ -40,43 +43,59 @@ jobs:
             echo "docker-compose.yml not found"
           fi
       
-      - name: Setup Docker Compose
+      - name: Setup Docker Compose V1
         run: |
-          echo "Setting up Docker Compose..."
+          echo "Installing Docker Compose V1..."
+          DOCKER_COMPOSE_VERSION=1.29.2
           
-          # Check if Docker Compose V2 plugin is available
-          if ! docker compose version &>/dev/null; then
-            echo "Docker Compose V2 plugin not available, setting up..."
-            DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
-            mkdir -p $DOCKER_CONFIG/cli-plugins
-            COMPOSE_VERSION="v2.19.1"
-            echo "Installing Docker Compose version: $COMPOSE_VERSION"
-            curl -sL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o $DOCKER_CONFIG/cli-plugins/docker-compose
-            chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
-            docker compose version
-          else
-            echo "Docker Compose V2 plugin already available:"
-            docker compose version
-          fi
+          # Download Docker Compose binary
+          sudo curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
           
-          # Also install standalone Docker Compose V1 for compatibility
-          if ! command -v docker-compose &>/dev/null; then
-            echo "Docker Compose V1 not found, installing..."
-            sudo curl -SL "https://github.com/docker/compose/releases/download/v1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            sudo chmod +x /usr/local/bin/docker-compose
-            docker-compose --version
-          else
-            echo "Docker Compose V1 already available:"
-            docker-compose --version
-          fi
+          # Apply executable permissions
+          sudo chmod +x /usr/local/bin/docker-compose
           
-          # Verify correct installation
-          echo "Final Docker Compose status:"
-          which docker-compose
+          # Verify installation
           docker-compose --version
+
+      - name: Setup Docker Compose V2
+        run: |
+          echo "Setting up Docker Compose V2..."
+          
+          # Create Docker CLI plugins directory
+          mkdir -p $HOME/.docker/cli-plugins
+          
+          # Download Docker Compose binary
+          curl -SL "https://github.com/docker/compose/releases/download/v2.19.1/docker-compose-$(uname -s)-$(uname -m)" -o $HOME/.docker/cli-plugins/docker-compose
+          
+          # Apply executable permissions
+          chmod +x $HOME/.docker/cli-plugins/docker-compose
+          
+          # Verify installation
           docker compose version
       
-      - name: Test Docker Compose with test file
+      - name: Verify Docker Compose Installation
+        run: |
+          echo "Verifying Docker Compose installations:"
+          
+          # Verify Docker Compose V1
+          which docker-compose || echo "docker-compose command not found"
+          docker-compose --version || echo "docker-compose failed to execute"
+          
+          # Verify Docker Compose V2
+          docker compose version || echo "docker compose plugin failed to execute"
+          
+          # Check paths
+          echo "PATH: $PATH"
+          echo "Docker CLI plugins:"
+          ls -la $HOME/.docker/cli-plugins/ || echo "CLI plugins directory not found"
+          
+          echo "Location of docker-compose binary:"
+          which docker-compose || echo "docker-compose not in PATH"
+          
+          echo "Docker info:"
+          docker info || echo "Failed to get Docker info"
+      
+      - name: Test with Hello World
         run: |
           # Create a simple test docker-compose file
           cat > docker-compose-test.yml << EOF
@@ -88,17 +107,17 @@ jobs:
               container_name: test-hello-world
           EOF
           
-          # Try using Docker Compose V2 first
+          # Test with Docker Compose V2
           echo "Testing with Docker Compose V2..."
-          if docker compose -f docker-compose-test.yml up; then
-            echo "Docker Compose V2 test successful"
-          else
-            echo "Docker Compose V2 test failed, trying V1..."
-            # Try with V1 as fallback
-            docker-compose -f docker-compose-test.yml up
-          fi
+          docker compose -f docker-compose-test.yml config
+          docker compose -f docker-compose-test.yml up --abort-on-container-exit
+          
+          # Test with Docker Compose V1
+          echo "Testing with Docker Compose V1..."
+          docker-compose -f docker-compose-test.yml config
+          docker-compose -f docker-compose-test.yml up --abort-on-container-exit
       
-      - name: Test with actual BioGears docker-compose file
+      - name: Test with BioGears Compose File
         run: |
           if [ -f "docker-compose.yml" ]; then
             echo "Testing with actual BioGears docker-compose.yml..."
@@ -106,21 +125,17 @@ jobs:
             # Modify to use publicly available images for testing
             sed -i 's|image: biogears-external|image: ubuntu:18.04|g' docker-compose.yml
             
-            # Test Docker Compose V2 parsing
-            docker compose config || echo "Docker Compose V2 config check failed"
+            # List services with Docker Compose V2
+            echo "Available services (V2):"
+            docker compose config --services
             
-            # Try listing services
-            echo "Available services:"
-            docker compose config --services || docker-compose config --services
-            
-            # Try to build the external image only (safer test)
-            if [ -d "docker/external" ] && [ -f "docker/external/Dockerfile" ]; then
-              echo "Building external image with Docker Compose..."
-              docker compose build biogears-external || docker-compose build biogears-external
-            fi
+            # List services with Docker Compose V1
+            echo "Available services (V1):"
+            docker-compose config --services
           else
-            echo "No docker-compose.yml found to test"
-            # Create a test one based on what we know
+            echo "No docker-compose.yml found, creating test file..."
+            
+            # Create a test compose file based on what we know
             cat > docker-compose-biogears.yml << EOF
             version: "2"
             
@@ -129,18 +144,33 @@ jobs:
                 build:
                   context: ./docker/external
                   dockerfile: Dockerfile
-                image: biogears-external
+                image: biogears-external-test
             EOF
             
             # Test the created file
             echo "Testing with created docker-compose-biogears.yml"
-            docker compose -f docker-compose-biogears.yml config || docker-compose -f docker-compose-biogears.yml config
-            docker compose -f docker-compose-biogears.yml build biogears-external || docker-compose -f docker-compose-biogears.yml build biogears-external
+            docker compose -f docker-compose-biogears.yml config
+            docker-compose -f docker-compose-biogears.yml config
+          fi
+      
+      - name: Build External Image (if possible)
+        run: |
+          if [ -d "docker/external" ] && [ -f "docker/external/Dockerfile" ]; then
+            echo "Building external image with Docker..."
+            docker build -t biogears-external-test docker/external
+            
+            if [ -f "docker-compose.yml" ]; then
+              echo "Building with docker-compose..."
+              docker-compose build biogears-external || echo "Failed to build with docker-compose"
+            fi
+          else
+            echo "External Dockerfile not found, skipping build test"
           fi
       
       - name: Cleanup
         run: |
           echo "Cleaning up test containers..."
           docker rm -f test-hello-world || true
+          docker rmi biogears-external-test || true
           
-          echo "Test completed successfully" 
+          echo "Test completed" 
