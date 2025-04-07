@@ -131,13 +131,13 @@ jobs:
             echo "    -DCMAKE_CXX_STANDARD=20 \\" >> docker/modified/Dockerfile.builder
             echo "    -DCMAKE_CXX_STANDARD_REQUIRED=ON \\" >> docker/modified/Dockerfile.builder
             echo "    -DCMAKE_CXX_EXTENSIONS=OFF \\" >> docker/modified/Dockerfile.builder
-            echo "    -DCMAKE_CXX_FLAGS=\"-std=gnu++20\" \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_FLAGS=\"-std=gnu++20 -DEIGEN_RELAXED_DECL_SPEC\" \\" >> docker/modified/Dockerfile.builder
             echo "    -DCMAKE_C_COMPILER=/usr/bin/gcc-11 \\" >> docker/modified/Dockerfile.builder
             echo "    -DCMAKE_CXX_COMPILER=/usr/bin/g++-11 .." >> docker/modified/Dockerfile.builder
             
             # Add compiler flags directly to the make command with diagnostics
             echo "# Run make with explicit C++20 flags for GCC-11" >> docker/modified/Dockerfile.builder
-            echo "RUN cd /opt/biogears/core/build && CXXFLAGS='-std=gnu++20 -fconcepts' make install || true" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && CXXFLAGS='-std=gnu++20 -fconcepts -DEIGEN_RELAXED_DECL_SPEC' make install || true" >> docker/modified/Dockerfile.builder
             
             # Add debugging commands to verify directory permissions
             echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
@@ -200,13 +200,13 @@ jobs:
             echo "    -DCMAKE_CXX_STANDARD=20 \\" >> docker/modified/Dockerfile.builder
             echo "    -DCMAKE_CXX_STANDARD_REQUIRED=ON \\" >> docker/modified/Dockerfile.builder
             echo "    -DCMAKE_CXX_EXTENSIONS=OFF \\" >> docker/modified/Dockerfile.builder
-            echo "    -DCMAKE_CXX_FLAGS=\"-std=gnu++20\" \\" >> docker/modified/Dockerfile.builder
+            echo "    -DCMAKE_CXX_FLAGS=\"-std=gnu++20 -DEIGEN_RELAXED_DECL_SPEC\" \\" >> docker/modified/Dockerfile.builder
             echo "    -DCMAKE_C_COMPILER=/usr/bin/gcc-11 \\" >> docker/modified/Dockerfile.builder
             echo "    -DCMAKE_CXX_COMPILER=/usr/bin/g++-11 .." >> docker/modified/Dockerfile.builder
             
             # Add compiler flags directly to the make command with diagnostics
             echo "# Run make with explicit C++20 flags for GCC-11" >> docker/modified/Dockerfile.builder
-            echo "RUN cd /opt/biogears/core/build && CXXFLAGS='-std=gnu++20 -fconcepts' make install || true" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && CXXFLAGS='-std=gnu++20 -fconcepts -DEIGEN_RELAXED_DECL_SPEC' make install || true" >> docker/modified/Dockerfile.builder
             
             # Add debugging commands to verify directory permissions
             echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
