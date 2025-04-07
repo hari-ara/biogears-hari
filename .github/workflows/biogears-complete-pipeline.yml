@@ -114,6 +114,10 @@ jobs:
             echo "RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100 --slave /usr/bin/g++ g++ /usr/bin/g++-10" >> docker/modified/Dockerfile.builder
             echo "RUN gcc --version && g++ --version" >> docker/modified/Dockerfile.builder
             
+            # Configure CMake with C++20 support
+            echo "# Tell CMake to use C++20 standard" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && cmake -DCMAKE_CXX_STANDARD=20 -DCMAKE_CXX_FLAGS=-std=c++2a .." >> docker/modified/Dockerfile.builder
+            
             # Add debugging commands to verify directory permissions
             echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
             echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/biogears || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
