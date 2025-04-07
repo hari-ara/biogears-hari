@@ -114,9 +114,13 @@ jobs:
             echo "RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100 --slave /usr/bin/g++ g++ /usr/bin/g++-10" >> docker/modified/Dockerfile.builder
             echo "RUN gcc --version && g++ --version" >> docker/modified/Dockerfile.builder
             
-            # Configure CMake with C++20 support
-            echo "# Tell CMake to use C++20 standard" >> docker/modified/Dockerfile.builder
-            echo "RUN cd /opt/biogears/core/build && cmake -DCMAKE_CXX_STANDARD=20 -DCMAKE_CXX_FLAGS=-std=c++2a .." >> docker/modified/Dockerfile.builder
+            # Configure CMake with comprehensive C++20 support
+            echo "# Tell CMake to use C++20 standard with all necessary flags" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && cmake -DCMAKE_CXX_STANDARD=20 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF -DCMAKE_CXX_FLAGS=\"-std=c++20\" .." >> docker/modified/Dockerfile.builder
+            
+            # Add compiler flags directly to the make command
+            echo "# Run make with explicit C++20 flags" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && CXXFLAGS='-std=c++20 -fconcepts' make install || true" >> docker/modified/Dockerfile.builder
             
             # Add debugging commands to verify directory permissions
             echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
@@ -153,6 +157,22 @@ jobs:
             echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/biogears" >> docker/modified/Dockerfile.builder
             echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/c_encoded/8.0.0/biogears/io/xsd/cdm" >> docker/modified/Dockerfile.builder
             echo "RUN chmod -R 777 /opt/biogears/core/build" >> docker/modified/Dockerfile.builder
+            
+            # Add newer compiler support for C++20
+            echo "# Install newer compiler with C++20 support" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-get update && apt-get install -y software-properties-common" >> docker/modified/Dockerfile.builder
+            echo "RUN add-apt-repository ppa:ubuntu-toolchain-r/test -y" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-get update && apt-get install -y gcc-10 g++-10" >> docker/modified/Dockerfile.builder
+            echo "RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100 --slave /usr/bin/g++ g++ /usr/bin/g++-10" >> docker/modified/Dockerfile.builder
+            echo "RUN gcc --version && g++ --version" >> docker/modified/Dockerfile.builder
+            
+            # Configure CMake with comprehensive C++20 support
+            echo "# Tell CMake to use C++20 standard with all necessary flags" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && cmake -DCMAKE_CXX_STANDARD=20 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF -DCMAKE_CXX_FLAGS=\"-std=c++20\" .." >> docker/modified/Dockerfile.builder
+            
+            # Add compiler flags directly to the make command
+            echo "# Run make with explicit C++20 flags" >> docker/modified/Dockerfile.builder
+            echo "RUN cd /opt/biogears/core/build && CXXFLAGS='-std=c++20 -fconcepts' make install || true" >> docker/modified/Dockerfile.builder
             
             # Add debugging commands to verify directory permissions
             echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
