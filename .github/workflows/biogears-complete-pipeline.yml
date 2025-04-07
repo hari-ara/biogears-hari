@@ -61,42 +61,8 @@ jobs:
             docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest \
               -f docker/external/Dockerfile docker/external
           else
-            echo "No external Dockerfile found, creating minimal one"
-            # Create directory for external dependencies Dockerfile
-            mkdir -p docker/biogears
-            
-            # Create a minimal external dependencies Dockerfile
-            echo 'FROM ubuntu:20.04' > docker/biogears/Dockerfile.external
-            echo '' >> docker/biogears/Dockerfile.external
-            echo 'ENV DEBIAN_FRONTEND=noninteractive' >> docker/biogears/Dockerfile.external
-            echo 'ENV TZ=Etc/UTC' >> docker/biogears/Dockerfile.external
-            echo '' >> docker/biogears/Dockerfile.external
-            echo '# Install basic dependencies' >> docker/biogears/Dockerfile.external
-            echo 'RUN apt-get update && \' >> docker/biogears/Dockerfile.external
-            echo '    apt-get install -y \' >> docker/biogears/Dockerfile.external
-            echo '    build-essential \' >> docker/biogears/Dockerfile.external
-            echo '    cmake \' >> docker/biogears/Dockerfile.external
-            echo '    git \' >> docker/biogears/Dockerfile.external
-            echo '    wget \' >> docker/biogears/Dockerfile.external
-            echo '    libxml2-dev \' >> docker/biogears/Dockerfile.external
-            echo '    libxerces-c-dev \' >> docker/biogears/Dockerfile.external
-            echo '    liblog4cpp5-dev \' >> docker/biogears/Dockerfile.external
-            echo '    libeigen3-dev && \' >> docker/biogears/Dockerfile.external
-            echo '    rm -rf /var/lib/apt/lists/*' >> docker/biogears/Dockerfile.external
-            echo '' >> docker/biogears/Dockerfile.external
-            echo '# Install CodeSynthesis XSD' >> docker/biogears/Dockerfile.external
-            echo 'RUN wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb && \' >> docker/biogears/Dockerfile.external
-            echo '    dpkg -i xsd_4.0.0-1_amd64.deb && \' >> docker/biogears/Dockerfile.external
-            echo '    rm xsd_4.0.0-1_amd64.deb' >> docker/biogears/Dockerfile.external
-            echo '' >> docker/biogears/Dockerfile.external
-            echo 'ENV PATH="/usr/local/bin:${PATH}"' >> docker/biogears/Dockerfile.external
-            echo 'WORKDIR /opt/biogears' >> docker/biogears/Dockerfile.external
-            echo '' >> docker/biogears/Dockerfile.external
-            echo 'CMD ["/bin/bash"]' >> docker/biogears/Dockerfile.external
-            
-            docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest \
-              -f docker/biogears/Dockerfile.external \
-              docker/biogears
+            echo "Error: Required docker/external/Dockerfile not found"
+            exit 1
           fi
           
           # Tag with date-based version
@@ -129,85 +95,14 @@ jobs:
             echo "Modified Dockerfile contents:"
             cat docker/modified/Dockerfile.builder
             
-            # Attempt to build with the project's Dockerfile
+            # Build with the project's Dockerfile
             echo "Building BioGears using modified project Dockerfile..."
             docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
               -f docker/modified/Dockerfile.builder \
-              . || {
-                echo "Real build failed, creating dummy builder image instead"
-                
-                # Create a simple builder Dockerfile that doesn't try to build the actual project
-                echo "FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest" > docker/biogears/Dockerfile.builder
-                echo "" >> docker/biogears/Dockerfile.builder
-                echo "# Set environment variables" >> docker/biogears/Dockerfile.builder
-                echo "ENV DEBIAN_FRONTEND=noninteractive" >> docker/biogears/Dockerfile.builder
-                echo "ENV TZ=Etc/UTC" >> docker/biogears/Dockerfile.builder
-                echo "" >> docker/biogears/Dockerfile.builder
-                
-                # Skip real build, just create dummy artifacts for testing the workflow
-                echo "# Create dummy artifacts for testing" >> docker/biogears/Dockerfile.builder
-                echo "RUN mkdir -p /artifacts/lib /artifacts/bin && \\" >> docker/biogears/Dockerfile.builder
-                echo "    echo 'This is a dummy shared library' > /artifacts/lib/libbiogears.so && \\" >> docker/biogears/Dockerfile.builder
-                echo "    echo 'This is a dummy static library' > /artifacts/lib/libbiogears.a && \\" >> docker/biogears/Dockerfile.builder
-                echo "    echo '#!/bin/bash' > /artifacts/bin/bg-cli && \\" >> docker/biogears/Dockerfile.builder
-                echo "    echo 'echo \"BioGears CLI Simulator\"' >> /artifacts/bin/bg-cli && \\" >> docker/biogears/Dockerfile.builder
-                echo "    chmod +x /artifacts/bin/bg-cli" >> docker/biogears/Dockerfile.builder
-                echo "" >> docker/biogears/Dockerfile.builder
-                
-                # Create output directories for the build products
-                echo "RUN mkdir -p /usr/local/lib /usr/local/bin && \\" >> docker/biogears/Dockerfile.builder
-                echo "    cp -r /artifacts/lib/* /usr/local/lib/ && \\" >> docker/biogears/Dockerfile.builder
-                echo "    cp -r /artifacts/bin/* /usr/local/bin/" >> docker/biogears/Dockerfile.builder
-                echo "" >> docker/biogears/Dockerfile.builder
-                echo "WORKDIR /opt/biogears" >> docker/biogears/Dockerfile.builder
-                echo "CMD [\"/bin/bash\"]" >> docker/biogears/Dockerfile.builder
-                
-                echo "Dummy Builder Dockerfile contents:"
-                cat docker/biogears/Dockerfile.builder
-                
-                # Build a simplified builder image
-                echo "Building dummy biogears-builder image..."
-                docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
-                  -f docker/biogears/Dockerfile.builder \
-                  docker/biogears
-              }
+              .
           else
-            echo "No builder Dockerfile found, creating dummy one"
-            
-            # Create a simple builder Dockerfile that doesn't try to build the actual project
-            echo "FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest" > docker/biogears/Dockerfile.builder
-            echo "" >> docker/biogears/Dockerfile.builder
-            echo "# Set environment variables" >> docker/biogears/Dockerfile.builder
-            echo "ENV DEBIAN_FRONTEND=noninteractive" >> docker/biogears/Dockerfile.builder
-            echo "ENV TZ=Etc/UTC" >> docker/biogears/Dockerfile.builder
-            echo "" >> docker/biogears/Dockerfile.builder
-            
-            # Skip real build, just create dummy artifacts for testing the workflow
-            echo "# Create dummy artifacts for testing" >> docker/biogears/Dockerfile.builder
-            echo "RUN mkdir -p /artifacts/lib /artifacts/bin && \\" >> docker/biogears/Dockerfile.builder
-            echo "    echo 'This is a dummy shared library' > /artifacts/lib/libbiogears.so && \\" >> docker/biogears/Dockerfile.builder
-            echo "    echo 'This is a dummy static library' > /artifacts/lib/libbiogears.a && \\" >> docker/biogears/Dockerfile.builder
-            echo "    echo '#!/bin/bash' > /artifacts/bin/bg-cli && \\" >> docker/biogears/Dockerfile.builder
-            echo "    echo 'echo \"BioGears CLI Simulator\"' >> /artifacts/bin/bg-cli && \\" >> docker/biogears/Dockerfile.builder
-            echo "    chmod +x /artifacts/bin/bg-cli" >> docker/biogears/Dockerfile.builder
-            echo "" >> docker/biogears/Dockerfile.builder
-            
-            # Create output directories for the build products
-            echo "RUN mkdir -p /usr/local/lib /usr/local/bin && \\" >> docker/biogears/Dockerfile.builder
-            echo "    cp -r /artifacts/lib/* /usr/local/lib/ && \\" >> docker/biogears/Dockerfile.builder
-            echo "    cp -r /artifacts/bin/* /usr/local/bin/" >> docker/biogears/Dockerfile.builder
-            echo "" >> docker/biogears/Dockerfile.builder
-            echo "WORKDIR /opt/biogears" >> docker/biogears/Dockerfile.builder
-            echo "CMD [\"/bin/bash\"]" >> docker/biogears/Dockerfile.builder
-            
-            echo "Builder Dockerfile contents:"
-            cat docker/biogears/Dockerfile.builder
-            
-            # Build a simplified builder image
-            echo "Building biogears-builder image..."
-            docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
-              -f docker/biogears/Dockerfile.builder \
-              docker/biogears
+            echo "Error: Required docker/release/Dockerfile not found"
+            exit 1
           fi
           
           # Tag with date-based version
@@ -235,25 +130,17 @@ jobs:
           
           # Extract the built libraries and binaries from the artifacts directory
           echo "Extracting artifacts from container..."
-          docker cp $CONTAINER_ID:/artifacts/lib/. build/lib/ || echo "Failed to copy libraries"
-          docker cp $CONTAINER_ID:/artifacts/bin/. build/bin/ || echo "Failed to copy binaries"
-          
-          # Also try extracting from usr/local if artifacts are missing
-          echo "Extracting from /usr/local as a backup..."
-          docker cp $CONTAINER_ID:/usr/local/lib/. build/lib/ || echo "Failed to copy libraries from /usr/local/lib"
-          docker cp $CONTAINER_ID:/usr/local/bin/. build/bin/ || echo "Failed to copy binaries from /usr/local/bin"
+          docker cp $CONTAINER_ID:/artifacts/lib/. build/lib/ || { echo "Failed to copy libraries"; exit 1; }
+          docker cp $CONTAINER_ID:/artifacts/bin/. build/bin/ || { echo "Failed to copy binaries"; exit 1; }
           
           # Remove the temporary container
           docker rm $CONTAINER_ID
           
           # List extracted contents
           echo "Extracted libraries:"
-          ls -la build/lib/ || echo "No libraries extracted"
+          ls -la build/lib/ || { echo "No libraries extracted"; exit 1; }
           echo "Extracted binaries:"
-          ls -la build/bin/ || echo "No binaries extracted"
-          
-          # Create empty files if directories are empty to prevent artifacts upload failure
-          touch build/lib/.keepme build/bin/.keepme
+          ls -la build/bin/ || { echo "No binaries extracted"; exit 1; }
       
       - name: Create build metadata
         shell: bash
@@ -339,40 +226,31 @@ jobs:
           # Create a directory for Docker builds
           mkdir -p docker-context/lib docker-context/bin
           
-          # Create a simple build metadata file if it doesn't exist
+          # Verify build-metadata.json exists
           if [ ! -f "build-output/build-metadata.json" ]; then
-            echo "Creating dummy build-metadata.json"
-            echo '{' > build-output/build-metadata.json
-            echo '  "builder_id": "github-actions-docker",' >> build-output/build-metadata.json
-            echo '  "build_type": "Release",' >> build-output/build-metadata.json
-            echo '  "source_repo": "${{ github.server_url }}/${{ github.repository }}",' >> build-output/build-metadata.json
-            echo '  "commit_hash": "${{ github.sha }}",' >> build-output/build-metadata.json
-            echo '  "build_timestamp": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",' >> build-output/build-metadata.json
-            echo '  "build_platform": "linux"' >> build-output/build-metadata.json
-            echo '}' >> build-output/build-metadata.json
+            echo "Error: build-metadata.json not found"
+            exit 1
           fi
 
           # Copy files with error handling
           echo "Copying lib directory..."
           if [ -d "build-output/lib" ]; then
-            cp -r build-output/lib/* docker-context/lib/ || echo "Failed to copy lib directory contents"
+            cp -r build-output/lib/* docker-context/lib/ || { echo "Failed to copy lib directory contents"; exit 1; }
           else
-            echo "Creating dummy library file"
-            echo "Dummy shared library" > docker-context/lib/libbiogears.so
+            echo "Error: lib directory not found"
+            exit 1
           fi
           
           echo "Copying bin directory..."
           if [ -d "build-output/bin" ]; then
-            cp -r build-output/bin/* docker-context/bin/ || echo "Failed to copy bin directory contents"
+            cp -r build-output/bin/* docker-context/bin/ || { echo "Failed to copy bin directory contents"; exit 1; }
           else
-            echo "Creating dummy executable"
-            echo '#!/bin/bash' > docker-context/bin/bg-cli
-            echo 'echo "BioGears CLI Simulator"' >> docker-context/bin/bg-cli
-            chmod +x docker-context/bin/bg-cli
+            echo "Error: bin directory not found"
+            exit 1
           fi
           
           echo "Copying build metadata..."
-          cp build-output/build-metadata.json docker-context/ || echo "Failed to copy build-metadata.json"
+          cp build-output/build-metadata.json docker-context/ || { echo "Failed to copy build-metadata.json"; exit 1; }
           
           echo "Docker context contents:"
           find docker-context -type f | sort
@@ -460,7 +338,7 @@ jobs:
         shell: bash
         run: |
           # Use . instead of source for POSIX shell compatibility
-          . ./image-digest.txt || { echo "Failed to load image-digest.txt"; cat ./image-digest.txt; }
+          . ./image-digest.txt || { echo "Failed to load image-digest.txt"; cat ./image-digest.txt; exit 1; }
           
           # Generate SBOM and scan image (all in one command)
           trivy image --format cyclonedx --output sbom-with-vulns.cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
@@ -819,7 +697,7 @@ jobs:
         shell: bash
         run: |
           # Use . instead of source for POSIX shell compatibility
-          . ./image-digest.txt || { echo "Failed to load image-digest.txt"; cat ./image-digest.txt; }
+          . ./image-digest.txt || { echo "Failed to load image-digest.txt"; cat ./image-digest.txt; exit 1; }
           
           # Create image metadata file for in-toto attestations
           cat > image-data.json << EOF
