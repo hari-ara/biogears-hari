@@ -33,15 +33,12 @@ jobs:
           find . -name "Dockerfile" | sort
           echo "Docker directory contents (if exists):"
           [ -d "docker" ] && ls -la docker/ || echo "No docker directory found"
-          echo "Checking subdirectories for Docker files:"
-          for dir in */; do
-            echo "Contents of $dir:"
-            ls -la "$dir" || echo "Failed to list $dir"
-            if [ -d "$dir/docker" ]; then
-              echo "Docker directory in $dir:"
-              ls -la "$dir/docker"
-            fi
-          done
+          echo "GitHub runner OS information:"
+          uname -a
+          
+          # Try to determine sed version/type for debugging
+          echo "Sed version info:"
+          sed --version || echo "sed --version not supported"
       
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -59,124 +56,126 @@ jobs:
           # Enhanced debugging for Docker files
           echo "Looking for Dockerfiles..."
           echo "All Dockerfiles in repository:"
-          find . -name "Dockerfile" -type f | tee all_dockerfiles.txt
+          find . -name "Dockerfile" -type f | tee all_dockerfiles.txt || echo "No Dockerfiles found"
           
           # Count Dockerfiles
-          DOCKERFILE_COUNT=$(wc -l < all_dockerfiles.txt || echo "0")
+          DOCKERFILE_COUNT=$(grep -c "" all_dockerfiles.txt 2>/dev/null || echo "0")
           echo "Found $DOCKERFILE_COUNT Dockerfiles in repository"
           
-          if [ "$DOCKERFILE_COUNT" -eq "0" ]; then
+          if [ "$DOCKERFILE_COUNT" = "0" ]; then
             echo "No Dockerfiles found in repository, creating minimal ones"
             
             # Create directory for external dependencies Dockerfile
             mkdir -p docker/external
             
-            # Create a minimal external dependencies Dockerfile
-            cat > docker/external/Dockerfile << 'EOF'
-            FROM ubuntu:20.04
-            
-            # Install basic dependencies
-            RUN apt-get update && \
-                apt-get install -y \
-                build-essential \
-                cmake \
-                git \
-                wget \
-                libxml2-dev \
-                libxerces-c-dev \
-                liblog4cpp5-dev \
-                libeigen3-dev \
-                && rm -rf /var/lib/apt/lists/*
-            
-            # Install CodeSynthesis XSD
-            RUN wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb && \
-                dpkg -i xsd_4.0.0-1_amd64.deb && \
-                rm xsd_4.0.0-1_amd64.deb
-            
-            ENV PATH="/usr/local/bin:${PATH}"
-            WORKDIR /opt/biogears
-            
-            CMD ["/bin/bash"]
-            EOF
+            # Create a minimal external dependencies Dockerfile - simpler approach
+            echo 'FROM ubuntu:20.04' > docker/external/Dockerfile
+            echo '' >> docker/external/Dockerfile
+            echo '# Install basic dependencies' >> docker/external/Dockerfile
+            echo 'RUN apt-get update && \\' >> docker/external/Dockerfile
+            echo '    apt-get install -y \\' >> docker/external/Dockerfile
+            echo '    build-essential \\' >> docker/external/Dockerfile
+            echo '    cmake \\' >> docker/external/Dockerfile
+            echo '    git \\' >> docker/external/Dockerfile
+            echo '    wget \\' >> docker/external/Dockerfile
+            echo '    libxml2-dev \\' >> docker/external/Dockerfile
+            echo '    libxerces-c-dev \\' >> docker/external/Dockerfile
+            echo '    liblog4cpp5-dev \\' >> docker/external/Dockerfile
+            echo '    libeigen3-dev && \\' >> docker/external/Dockerfile
+            echo '    rm -rf /var/lib/apt/lists/*' >> docker/external/Dockerfile
+            echo '' >> docker/external/Dockerfile
+            echo '# Install CodeSynthesis XSD' >> docker/external/Dockerfile
+            echo 'RUN wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb && \\' >> docker/external/Dockerfile
+            echo '    dpkg -i xsd_4.0.0-1_amd64.deb && \\' >> docker/external/Dockerfile
+            echo '    rm xsd_4.0.0-1_amd64.deb' >> docker/external/Dockerfile
+            echo '' >> docker/external/Dockerfile
+            echo 'ENV PATH="/usr/local/bin:${PATH}"' >> docker/external/Dockerfile
+            echo 'WORKDIR /opt/biogears' >> docker/external/Dockerfile
+            echo '' >> docker/external/Dockerfile
+            echo 'CMD ["/bin/bash"]' >> docker/external/Dockerfile
             
             # Create directory for builder Dockerfile
             mkdir -p docker/builder
             
-            # Create a minimal builder Dockerfile
-            cat > docker/builder/Dockerfile << 'EOF'
-            ARG EXTERNAL_IMAGE=ghcr.io/hari-ara/biogears-hari-external:latest
-            FROM ${EXTERNAL_IMAGE}
-            
-            # Copy source code
-            COPY . /opt/biogears/core
-            
-            # Build BioGears
-            WORKDIR /opt/biogears/core
-            RUN mkdir -p build && \
-                cd build && \
-                cmake .. -DCMAKE_BUILD_TYPE=Release && \
-                cmake --build . --parallel $(nproc) && \
-                cd ..
-            
-            # Copy built libraries and binaries to standard locations
-            RUN mkdir -p /usr/local/lib /usr/local/bin && \
-                cp -r build/lib/* /usr/local/lib/ && \
-                cp -r build/bin/* /usr/local/bin/
-            
-            WORKDIR /opt/biogears
-            CMD ["/bin/bash"]
-            EOF
+            # Create a minimal builder Dockerfile - simpler approach
+            echo 'FROM ghcr.io/hari-ara/biogears-hari-external:latest' > docker/builder/Dockerfile
+            echo '' >> docker/builder/Dockerfile
+            echo '# Copy source code' >> docker/builder/Dockerfile
+            echo 'COPY . /opt/biogears/core' >> docker/builder/Dockerfile
+            echo '' >> docker/builder/Dockerfile
+            echo '# Build BioGears' >> docker/builder/Dockerfile
+            echo 'WORKDIR /opt/biogears/core' >> docker/builder/Dockerfile
+            echo 'RUN mkdir -p build && \\' >> docker/builder/Dockerfile
+            echo '    cd build && \\' >> docker/builder/Dockerfile
+            echo '    cmake .. -DCMAKE_BUILD_TYPE=Release && \\' >> docker/builder/Dockerfile
+            echo '    cmake --build . --parallel $(nproc) && \\' >> docker/builder/Dockerfile
+            echo '    cd ..' >> docker/builder/Dockerfile
+            echo '' >> docker/builder/Dockerfile
+            echo '# Copy built libraries and binaries to standard locations' >> docker/builder/Dockerfile
+            echo 'RUN mkdir -p /usr/local/lib /usr/local/bin && \\' >> docker/builder/Dockerfile
+            echo '    find build -name "*.so*" -exec cp -v {} /usr/local/lib/ \\; && \\' >> docker/builder/Dockerfile
+            echo '    find build -name "*.a" -exec cp -v {} /usr/local/lib/ \\; && \\' >> docker/builder/Dockerfile
+            echo '    find build -type f -executable -not -path "*/CMakeFiles/*" -exec cp -v {} /usr/local/bin/ \\; || true' >> docker/builder/Dockerfile
+            echo '' >> docker/builder/Dockerfile
+            echo 'WORKDIR /opt/biogears' >> docker/builder/Dockerfile
+            echo 'CMD ["/bin/bash"]' >> docker/builder/Dockerfile
             
             echo "Created Dockerfiles:"
             find docker -name "Dockerfile" -type f | tee all_dockerfiles.txt
+            
+            echo "External Dockerfile contents:"
+            cat docker/external/Dockerfile
+            
+            echo "Builder Dockerfile contents:"
+            cat docker/builder/Dockerfile
           else
-            # Fix any problematic Dockerfiles in the repository
-            echo "Checking Dockerfiles for issues..."
-            for dockerfile in $(cat all_dockerfiles.txt); do
-              echo "Checking $dockerfile"
-              
-              # Fix common issues like invalid FROM lines
-              if grep -q "^FROM biogears-external" "$dockerfile"; then
-                echo "Found problematic FROM line in $dockerfile, fixing it"
-                # Create backup
+              # Fix any problematic Dockerfiles in the repository
+              echo "Checking Dockerfiles for issues..."
+              for dockerfile in $(cat all_dockerfiles.txt); do
+                echo "Checking $dockerfile"
+                
+                # Create a temporary file for transformations
+                TEMP_FILE="${dockerfile}.tmp"
+                
+                # Fix common issues like invalid FROM lines using pattern replacement
+                # without relying on sed -i which has different syntax across platforms
+                cat "$dockerfile" | while IFS= read -r line; do
+                  if [[ "$line" =~ ^FROM[[:space:]]*biogears-external ]]; then
+                    echo "Found and fixing: $line"
+                    echo "FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest" >> "$TEMP_FILE"
+                  elif [[ "$line" =~ ^FROM[[:space:]]*biogears-external: ]]; then
+                    echo "Found and fixing versioned: $line"
+                    version=$(echo "$line" | sed 's/^FROM[[:space:]]*biogears-external://g')
+                    echo "FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:$version" >> "$TEMP_FILE"
+                  elif [[ "$line" =~ ^FROM[[:space:]]*biogears-builder ]]; then
+                    echo "Found and fixing builder: $line"
+                    echo "FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest" >> "$TEMP_FILE"
+                  else
+                    echo "$line" >> "$TEMP_FILE"
+                  fi
+                done
+                
+                # Backup the original file and move the corrected version into place
                 cp "$dockerfile" "${dockerfile}.bak"
-                # Replace with correct image reference
-                sed -i "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" "$dockerfile"
-                echo "Fixed $dockerfile:"
-                grep "^FROM" "$dockerfile"
-              fi
-              
-              # Check for variations with whitespace or versions
-              if grep -q "^FROM[[:space:]]*biogears-external:" "$dockerfile"; then
-                echo "Found problematic versioned FROM line in $dockerfile, fixing it"
-                cp "$dockerfile" "${dockerfile}.bak2"
-                sed -i "s|^FROM[[:space:]]*biogears-external:|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:|g" "$dockerfile"
-                echo "Fixed $dockerfile:"
-                grep "^FROM" "$dockerfile"
-              fi
-              
-              # Also fix any FROM lines referencing biogears-builder
-              if grep -q "^FROM biogears-builder" "$dockerfile"; then
-                echo "Found problematic builder FROM line in $dockerfile, fixing it"
-                # Create backup
-                cp "$dockerfile" "${dockerfile}.bak"
-                # Replace with correct image reference  
-                sed -i "s|^FROM biogears-builder|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest|g" "$dockerfile"
-                echo "Fixed $dockerfile:"
-                grep "^FROM" "$dockerfile"
-              fi
-            done
+                cat "$TEMP_FILE" > "$dockerfile"
+                rm "$TEMP_FILE"
+                
+                echo "Modified file contents:"
+                cat "$dockerfile"
+              done
           fi
           
           # Pick the first Dockerfile for external dependencies
-          EXTERNAL_DOCKERFILE=$(grep -i "external" all_dockerfiles.txt | head -n 1)
+          EXTERNAL_DOCKERFILE=$(grep -i "external" all_dockerfiles.txt 2>/dev/null | head -n 1)
           
           if [ -z "$EXTERNAL_DOCKERFILE" ]; then
             echo "No external Dockerfile found, using the first one"
-            EXTERNAL_DOCKERFILE=$(head -n 1 all_dockerfiles.txt)
+            EXTERNAL_DOCKERFILE=$(head -n 1 all_dockerfiles.txt 2>/dev/null)
             
             if [ -z "$EXTERNAL_DOCKERFILE" ]; then
-              echo "ERROR: No Dockerfiles found in repository"
+              echo "ERROR: Failed to find Dockerfiles even after creating them"
+              echo "Current directory contents:"
+              find . -type f -name "Dockerfile" -o -name "dockerfile"
               exit 1
             fi
           fi
@@ -239,7 +238,21 @@ jobs:
               # If FROM doesn't use the ARG, make sure it's properly referenced
               if grep -q "^FROM biogears-external" "$BUILDER_DOCKERFILE"; then
                 echo "Fixing FROM line in $BUILDER_DOCKERFILE"
-                sed -i "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" "$BUILDER_DOCKERFILE"
+                
+                # Create a temporary file for the modified content
+                TEMP_FILE="${BUILDER_DOCKERFILE}.tmp"
+                cat "$BUILDER_DOCKERFILE" | while IFS= read -r line; do
+                  if [[ "$line" =~ ^FROM[[:space:]]*biogears-external ]]; then
+                    echo "FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest" >> "$TEMP_FILE"
+                  else
+                    echo "$line" >> "$TEMP_FILE"
+                  fi
+                done
+                
+                # Replace the original with the modified version
+                cp "$BUILDER_DOCKERFILE" "${BUILDER_DOCKERFILE}.bak2"
+                cp "$TEMP_FILE" "$BUILDER_DOCKERFILE"
+                rm "$TEMP_FILE"
               fi
             fi
             
