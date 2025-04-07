@@ -65,7 +65,7 @@ jobs:
           ctest -C ${{ matrix.build_type }} --output-on-failure -R "^(CommonData|CDM)" || true
       
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: biogears-build
           path: |
@@ -84,7 +84,7 @@ jobs:
         uses: actions/checkout@v3
       
       - name: Download build artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v2
         with:
           name: biogears-build
           path: build-output
@@ -146,7 +146,7 @@ jobs:
           echo "image_digest=$DIGEST" >> $GITHUB_OUTPUT
       
       - name: Upload image digest
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: image-digest
           path: image-digest.txt
@@ -162,7 +162,7 @@ jobs:
         uses: actions/checkout@v3
       
       - name: Download image digest
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v2
         with:
           name: image-digest
       
@@ -191,7 +191,7 @@ jobs:
           trivy image --format json --output trivy-scan.json ghcr.io/${{ github.repository_owner }}/biogears:${{ github.sha }}
       
       - name: Upload SBOM and scan results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: security-artifacts
           path: |
@@ -477,7 +477,7 @@ jobs:
           tar -czvf signed-policies.tar.gz policies/
       
       - name: Upload policies
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: policy-artifacts
           path: |
@@ -495,23 +495,23 @@ jobs:
         uses: actions/checkout@v3
       
       - name: Download build artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v2
         with:
           name: biogears-build
           path: build-output
       
       - name: Download image digest
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v2
         with:
           name: image-digest
       
       - name: Download security artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v2
         with:
           name: security-artifacts
       
       - name: Download policy artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v2
         with:
           name: policy-artifacts
       
@@ -587,7 +587,7 @@ jobs:
           tar -czvf all-signatures.tar.gz all-signatures/
       
       - name: Upload attestations
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: attestation-artifacts
           path: |
@@ -606,7 +606,7 @@ jobs:
         uses: actions/checkout@v3
       
       - name: Download all artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v2
       
       - name: Debug downloaded artifacts
         run: |
@@ -735,7 +735,7 @@ jobs:
           EOF
       
       - name: Upload pipeline report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: pipeline-report
           path: biogears-pipeline-report.md 
