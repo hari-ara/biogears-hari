@@ -102,12 +102,15 @@ jobs:
             # Add directory setup commands before the build
             echo "# Ensure schema directories exist with proper permissions" >> docker/modified/Dockerfile.builder
             echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm" >> docker/modified/Dockerfile.builder
+            echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/biogears" >> docker/modified/Dockerfile.builder
             echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/c_encoded/8.0.0/biogears/io/xsd/cdm" >> docker/modified/Dockerfile.builder
-            echo "RUN chmod -R 777 /opt/biogears/core/build/projects/biogears/generated" >> docker/modified/Dockerfile.builder
+            echo "RUN chmod -R 777 /opt/biogears/core/build" >> docker/modified/Dockerfile.builder
             
             # Add debugging commands to verify directory permissions
             echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
+            echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/biogears || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
             echo "RUN touch /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm/TestReport.hxx && echo 'Test file created successfully'" >> docker/modified/Dockerfile.builder
+            echo "RUN touch /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/biogears/BioGears.hxx && echo 'Test file created successfully'" >> docker/modified/Dockerfile.builder
             
             # Add the make and artifact collection commands
             echo "RUN make install || true" >> docker/modified/Dockerfile.builder
@@ -135,12 +138,15 @@ jobs:
             # Add directory setup commands before the build
             echo "# Ensure schema directories exist with proper permissions" >> docker/modified/Dockerfile.builder
             echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm" >> docker/modified/Dockerfile.builder
+            echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/biogears" >> docker/modified/Dockerfile.builder
             echo "RUN mkdir -p /opt/biogears/core/build/projects/biogears/generated/Release/c_encoded/8.0.0/biogears/io/xsd/cdm" >> docker/modified/Dockerfile.builder
-            echo "RUN chmod -R 777 /opt/biogears/core/build/projects/biogears/generated" >> docker/modified/Dockerfile.builder
+            echo "RUN chmod -R 777 /opt/biogears/core/build" >> docker/modified/Dockerfile.builder
             
             # Add debugging commands to verify directory permissions
             echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
+            echo "RUN ls -la /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/biogears || echo 'Directory does not exist yet'" >> docker/modified/Dockerfile.builder
             echo "RUN touch /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/cdm/TestReport.hxx && echo 'Test file created successfully'" >> docker/modified/Dockerfile.builder
+            echo "RUN touch /opt/biogears/core/build/projects/biogears/generated/Release/biogears/schema/biogears/BioGears.hxx && echo 'Test file created successfully'" >> docker/modified/Dockerfile.builder
             
             # Add the make and artifact collection commands
             echo "RUN make install || true" >> docker/modified/Dockerfile.builder
