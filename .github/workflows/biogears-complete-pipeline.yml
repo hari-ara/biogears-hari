@@ -12,13 +12,10 @@ permissions:
   packages: write
 
 jobs:
-  # Build BioGears from source on Linux
+  # Build BioGears from source on Linux using Docker
   build-linux:
     name: Build BioGears (Linux)
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        build_type: [Release] # We'll focus on Release for the pipeline
     
     steps:
       - name: Checkout code
@@ -26,75 +23,119 @@ jobs:
         with:
           fetch-depth: 0
       
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential liblog4cpp5-dev libxerces-c-dev libeigen3-dev wget \
-            git gcc g++ make cmake pkg-config libtool autoconf valgrind \
-            ninja-build ccache libboost-all-dev doxygen graphviz
-          
-          # Check installed dependency versions
-          echo "===== DEPENDENCY VERSIONS ====="
-          g++ --version
-          cmake --version
-          pkg-config --version
-          echo "===== LIBRARY VERSIONS ====="
-          pkg-config --modversion eigen3 || echo "eigen3.pc not found"
-          pkg-config --modversion xerces-c || echo "xerces-c.pc not found"
-          pkg-config --modversion log4cpp || echo "log4cpp.pc not found"
-          
-          # Install CodeSynthesis XSD
-          echo "===== INSTALLING CODESYNTHESIS XSD ====="
-          wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb
-          sudo dpkg -i xsd_4.0.0-1_amd64.deb
-          xsd --version || echo "xsd not properly installed"
-          
-          # Check directory structure
-          echo "===== DIRECTORY STRUCTURE ====="
-          ls -la
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
       
-      - name: Configure CMake
-        run: |
-          mkdir -p build
-          cd build
-          cmake .. -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_VERBOSE_MAKEFILE=ON
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       
-      - name: Build BioGears
+      - name: Build External Base Image
         run: |
-          cd build
-          echo "Processor count: $(nproc)"
-          echo "CMake version: $(cmake --version)"
-          echo "GCC version: $(gcc --version)"
-          echo "Build directory contents:"
-          ls -la
-          # Build with more verbose output and show where it fails
-          cmake --build . --parallel $(nproc) --verbose || { 
-            echo "===== BUILD FAILED ====="
-            echo "Last 100 lines of CMakeFiles/CMakeError.log:"
-            tail -n 100 CMakeFiles/CMakeError.log || echo "No CMakeError.log found"
-            echo "===== DETAILED ENVIRONMENT INFO ====="
-            env | sort
-            exit 1
-          }
+          # Build the external dependencies image first
+          echo "Building biogears-external image..."
+          
+          docker build -t ghcr.io/${{ github.repository_owner }}/biogears-external:latest --progress=plain -f docker/external/Dockerfile docker/external
+          
+          # Tag with date-based version
+          SHORT_SHA="${{ github.sha }}"
+          DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-external:latest ghcr.io/${{ github.repository_owner }}/biogears-external:${DATE_VERSION}
+          
+          # Get image digest
+          EXTERNAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-external:latest | cut -d'@' -f2 || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-external:latest)
+          echo "EXTERNAL_DIGEST=$EXTERNAL_DIGEST" > image-digests.txt
+          echo "EXTERNAL_VERSION=$DATE_VERSION" >> image-digests.txt
+          echo "External image digest: $EXTERNAL_DIGEST"
+      
+      - name: Build BioGears with Docker
+        run: |
+          # Build the BioGears builder image
+          echo "Building biogears-builder image..."
+          
+          if [ -f "docker/release/Dockerfile" ]; then
+            echo "Building with docker/release/Dockerfile..."
+            docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
+              --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
+              --progress=plain \
+              -f docker/release/Dockerfile .
+          elif [ -f "docker/builder/Dockerfile" ]; then
+            echo "Building with docker/builder/Dockerfile..."
+            docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
+              --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
+              --progress=plain \
+              -f docker/builder/Dockerfile .
+          else
+            # Find a suitable Dockerfile
+            echo "Looking for a suitable Dockerfile..."
+            for df in $(find docker -name "Dockerfile" | grep -v external); do
+              echo "Found Dockerfile: $df"
+              docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:latest \
+                --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:latest \
+                --progress=plain \
+                -f $df .
+              break
+            done
+          fi
+          
+          # Tag with date-based version
+          SHORT_SHA="${{ github.sha }}"
+          DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-builder:latest ghcr.io/${{ github.repository_owner }}/biogears-builder:${DATE_VERSION}
+          
+          # Get image digest
+          BUILDER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-builder:latest | cut -d'@' -f2 || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-builder:latest)
+          echo "BUILDER_DIGEST=$BUILDER_DIGEST" >> image-digests.txt
+          echo "BUILDER_VERSION=$DATE_VERSION" >> image-digests.txt
+          echo "Builder image digest: $BUILDER_DIGEST"
+      
+      - name: Extract built artifacts from Docker image
+        run: |
+          # Create a temporary container to extract artifacts from
+          CONTAINER_ID=$(docker create ghcr.io/${{ github.repository_owner }}/biogears-builder:latest)
+          
+          # Create directories for extracted files
+          mkdir -p build/lib build/bin
+          
+          # Extract the built libraries and binaries
+          docker cp $CONTAINER_ID:/usr/local/lib/. build/lib/
+          docker cp $CONTAINER_ID:/usr/local/bin/. build/bin/
+          
+          # Remove the temporary container
+          docker rm $CONTAINER_ID
+          
+          # List extracted contents
+          echo "Extracted libraries:"
+          ls -la build/lib/
+          echo "Extracted binaries:"
+          ls -la build/bin/
       
       - name: Create build metadata
         run: |
+          source image-digests.txt
           cat > build-metadata.json << EOF
           {
-            "builder_id": "github-actions",
-            "build_type": "${{ matrix.build_type }}",
+            "builder_id": "github-actions-docker",
+            "build_type": "Release",
             "source_repo": "${{ github.server_url }}/${{ github.repository }}",
             "commit_hash": "${{ github.sha }}",
             "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "build_platform": "linux"
+            "build_platform": "linux",
+            "docker_images": {
+              "external": {
+                "tag": "${EXTERNAL_VERSION}",
+                "digest": "${EXTERNAL_DIGEST}"
+              },
+              "builder": {
+                "tag": "${BUILDER_VERSION}",
+                "digest": "${BUILDER_DIGEST}"
+              }
+            }
           }
           EOF
-      
-      - name: Run tests
-        run: |
-          cd build
-          # Run only a small subset of tests for CI pipeline demonstration
-          ctest -C ${{ matrix.build_type }} --output-on-failure -R "^(CommonData|CDM)" || true
       
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -104,8 +145,8 @@ jobs:
             build/lib/
             build/bin/
             build-metadata.json
-
-  # Build Docker images containing BioGears
+            
+  # Build Docker runtime image containing BioGears
   build-docker:
     name: Build Docker Images
     needs: build-linux
