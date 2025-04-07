@@ -1,0 +1,267 @@
+name: Reusable Sign and Publish
+
+on:
+  workflow_call:
+    inputs:
+      registry_url:
+        required: true
+        type: string
+        description: "The URL of the OCI registry (e.g. ghcr.io)"
+      repository:
+        required: true
+        type: string
+        description: "The repository name (e.g. owner/image-name)"
+      artifact_path:
+        required: true
+        type: string
+        description: "Path to the artifact directory or file to publish"
+      artifact_type:
+        required: true
+        type: string
+        description: "Type of artifact to publish (image, sbom, attestation, policy)"
+      artifact_media_type:
+        required: false
+        type: string
+        default: "application/vnd.unknown.artifact.v1"
+        description: "Media type for the artifact"
+      tag:
+        required: false
+        type: string
+        default: "latest"
+        description: "Tag to apply to the artifact"
+      sign_artifact:
+        required: false
+        type: boolean
+        default: true
+        description: "Whether to sign the artifact with Cosign"
+      attestation_type:
+        required: false
+        type: string
+        default: ""
+        description: "Type of attestation to create if applicable (sbom, vuln, provenance)"
+    secrets:
+      registry_username:
+        required: true
+        description: "Username for the OCI registry"
+      registry_password:
+        required: true
+        description: "Password/token for the OCI registry"
+      signing_key:
+        required: false
+        description: "Cosign private key for signing (base64 encoded)"
+      signing_password:
+        required: false
+        description: "Password for the Cosign private key"
+
+jobs:
+  sign-and-publish:
+    name: Sign and Publish Artifact
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Install tools
+        run: |
+          # Install Cosign
+          curl -L -o cosign https://github.com/sigstore/cosign/releases/download/v2.1.1/cosign-linux-amd64
+          chmod +x cosign
+          sudo mv cosign /usr/local/bin/cosign
+          cosign version
+          
+          # Install ORAS
+          curl -LO https://github.com/oras-project/oras/releases/download/v1.1.0/oras_1.1.0_linux_amd64.tar.gz
+          mkdir -p oras-install/
+          tar -zxf oras_1.1.0_linux_amd64.tar.gz -C oras-install/
+          sudo mv oras-install/oras /usr/local/bin/
+          oras version
+      
+      - name: Prepare artifact
+        run: |
+          # Create artifact staging directory
+          mkdir -p artifact-staging
+          
+          # Copy artifact to staging directory
+          if [ -f "${{ inputs.artifact_path }}" ]; then
+            cp "${{ inputs.artifact_path }}" artifact-staging/
+            ARTIFACT_FILENAME=$(basename "${{ inputs.artifact_path }}")
+          elif [ -d "${{ inputs.artifact_path }}" ]; then
+            cp -r "${{ inputs.artifact_path }}"/* artifact-staging/
+            ARTIFACT_FILENAME="${{ inputs.artifact_type }}.tar.gz"
+            tar -czf "$ARTIFACT_FILENAME" -C artifact-staging .
+          else
+            echo "Error: Artifact path does not exist: ${{ inputs.artifact_path }}"
+            exit 1
+          fi
+          
+          # Set environment variables
+          echo "ARTIFACT_FILENAME=$ARTIFACT_FILENAME" >> $GITHUB_ENV
+          echo "REPOSITORY=${{ inputs.registry_url }}/${{ inputs.repository }}" >> $GITHUB_ENV
+          echo "ARTIFACT_TAG=${{ inputs.artifact_type }}-${{ inputs.tag }}" >> $GITHUB_ENV
+      
+      - name: Login to registry
+        run: |
+          # Login to OCI registry
+          echo "${{ secrets.registry_password }}" | docker login ${{ inputs.registry_url }} -u ${{ secrets.registry_username }} --password-stdin
+          
+          # Also set up ORAS to use the registry credentials
+          mkdir -p ~/.docker
+          echo "{\"auths\":{\"${{ inputs.registry_url }}\":{\"auth\":\"$(echo -n "${{ secrets.registry_username }}:${{ secrets.registry_password }}" | base64)\"}}}" > ~/.docker/config.json
+      
+      - name: Sign artifact
+        if: inputs.sign_artifact
+        run: |
+          # Decode and save the signing key if provided
+          if [ "${{ secrets.signing_key }}" != "" ]; then
+            echo "${{ secrets.signing_key }}" | base64 -d > cosign.key
+            chmod 600 cosign.key
+          else
+            # Generate a new key pair if not provided
+            echo "No signing key provided, generating a new one..."
+            cosign generate-key-pair
+          fi
+          
+          # Sign the artifact
+          if [ -f cosign.key ]; then
+            if [ "${{ secrets.signing_password }}" != "" ]; then
+              # Use provided password
+              echo "${{ secrets.signing_password }}" | cosign sign-blob --key cosign.key --output-signature ${{ env.ARTIFACT_FILENAME }}.sig ${{ env.ARTIFACT_FILENAME }}
+            else
+              # No password for key
+              cosign sign-blob --key cosign.key --output-signature ${{ env.ARTIFACT_FILENAME }}.sig ${{ env.ARTIFACT_FILENAME }}
+            fi
+          else
+            echo "Error: Cosign key not found"
+            exit 1
+          fi
+          
+          # Verify the signature
+          cosign verify-blob --key cosign.pub --signature ${{ env.ARTIFACT_FILENAME }}.sig ${{ env.ARTIFACT_FILENAME }}
+      
+      - name: Create attestation
+        if: inputs.attestation_type != ''
+        run: |
+          # Create attestation based on type
+          echo "Creating ${{ inputs.attestation_type }} attestation..."
+          
+          # Set predicate type based on attestation type
+          if [ "${{ inputs.attestation_type }}" == "sbom" ]; then
+            PREDICATE_TYPE="https://spdx.dev/Document"
+          elif [ "${{ inputs.attestation_type }}" == "vuln" ]; then
+            PREDICATE_TYPE="https://example.org/attestations/vuln/v1"
+          elif [ "${{ inputs.attestation_type }}" == "provenance" ]; then
+            PREDICATE_TYPE="https://slsa.dev/provenance/v0.2"
+          else
+            PREDICATE_TYPE="https://example.org/attestations/generic/v1"
+          fi
+          
+          # Create a simple attestation template
+          cat > attestation.json << EOF
+          {
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "subject": [
+              {
+                "name": "${{ env.REPOSITORY }}:${{ env.ARTIFACT_TAG }}",
+                "digest": {
+                  "sha256": "$(sha256sum ${{ env.ARTIFACT_FILENAME }} | awk '{print $1}')"
+                }
+              }
+            ],
+            "predicateType": "$PREDICATE_TYPE",
+            "predicate": {
+              "builder": {
+                "id": "github-actions"
+              },
+              "buildType": "github-workflow",
+              "invocation": {
+                "configSource": {
+                  "uri": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                  "digest": {
+                    "sha1": "${{ github.sha }}"
+                  },
+                  "entryPoint": "${{ github.workflow }}"
+                }
+              },
+              "metadata": {
+                "buildStartedOn": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+                "buildFinishedOn": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+                "completeness": {
+                  "parameters": true,
+                  "environment": true,
+                  "materials": true
+                },
+                "reproducible": false
+              }
+            }
+          }
+          EOF
+          
+          # Sign the attestation
+          if [ -f cosign.key ]; then
+            if [ "${{ secrets.signing_password }}" != "" ]; then
+              # Use provided password
+              echo "${{ secrets.signing_password }}" | cosign attest --key cosign.key --predicate attestation.json --type custom ${{ env.REPOSITORY }}:${{ env.ARTIFACT_TAG }}
+            else
+              # No password for key
+              cosign attest --key cosign.key --predicate attestation.json --type custom ${{ env.REPOSITORY }}:${{ env.ARTIFACT_TAG }}
+            fi
+          fi
+      
+      - name: Publish artifact with ORAS
+        run: |
+          # Determine media type
+          if [ "${{ inputs.artifact_media_type }}" != "application/vnd.unknown.artifact.v1" ]; then
+            MEDIA_TYPE="${{ inputs.artifact_media_type }}"
+          else
+            # Set default media type based on artifact type
+            case "${{ inputs.artifact_type }}" in
+              sbom)
+                MEDIA_TYPE="application/vnd.cyclonedx+json"
+                ;;
+              attestation)
+                MEDIA_TYPE="application/vnd.in-toto+json"
+                ;;
+              policy)
+                MEDIA_TYPE="application/vnd.openpolicyagent.rego"
+                ;;
+              *)
+                MEDIA_TYPE="application/tar+gzip"
+                ;;
+            esac
+          fi
+          
+          echo "Publishing artifact with ORAS using media type: $MEDIA_TYPE"
+          
+          # Push the artifact with ORAS
+          oras push ${{ env.REPOSITORY }}:${{ env.ARTIFACT_TAG }} ${{ env.ARTIFACT_FILENAME }}:$MEDIA_TYPE
+          
+          # If signed, also push the signature
+          if [ -f "${{ env.ARTIFACT_FILENAME }}.sig" ]; then
+            # Use v2 signature manifest format
+            oras push ${{ env.REPOSITORY }}:${{ env.ARTIFACT_TAG }}.sig ${{ env.ARTIFACT_FILENAME }}.sig:application/vnd.dev.cosign.simplesigning.v1+json
+          fi
+      
+      - name: Generate publication report
+        run: |
+          # Create report
+          cat > publication-report.md << EOF
+          ## Artifact Publication Report
+          
+          **Type:** ${{ inputs.artifact_type }}
+          **Repository:** ${{ env.REPOSITORY }}
+          **Tag:** ${{ env.ARTIFACT_TAG }}
+          **Media Type:** $MEDIA_TYPE
+          **Signed:** ${{ inputs.sign_artifact }}
+          **Attestation:** ${{ inputs.attestation_type }}
+          
+          ### Verification Commands
+          
+          ```bash
+          # Pull artifact
+          oras pull ${{ env.REPOSITORY }}:${{ env.ARTIFACT_TAG }}
+          
+          # Verify signature
+          cosign verify-blob --key cosign.pub --signature ${{ env.ARTIFACT_FILENAME }}.sig ${{ env.ARTIFACT_FILENAME }}
+          ```
+          EOF
+          
+          # Output report to step summary
+          cat publication-report.md >> $GITHUB_STEP_SUMMARY 

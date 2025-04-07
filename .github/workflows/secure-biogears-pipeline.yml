@@ -1,0 +1,415 @@
+name: Secure BioGears Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master, haritest ]
+    paths:
+      - '.github/workflows/secure-biogears-pipeline.yml'
+      - 'docker/**'
+      - 'docker-compose.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker-build:
+    name: Build BioGears Docker Images
+    runs-on: ubuntu-latest
+    outputs:
+      external_image: ${{ steps.set-outputs.outputs.external_image }}
+      builder_image: ${{ steps.set-outputs.outputs.builder_image }}
+      version_tag: ${{ steps.set-outputs.outputs.version_tag }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Setup Docker Compose
+        run: |
+          # Check if Docker Compose V2 plugin is available
+          if ! docker compose version &>/dev/null; then
+            echo "Docker Compose V2 plugin not available, setting up..."
+            DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
+            mkdir -p $DOCKER_CONFIG/cli-plugins
+            COMPOSE_VERSION="v2.19.1"
+            echo "Installing Docker Compose version: $COMPOSE_VERSION"
+            curl -sL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o $DOCKER_CONFIG/cli-plugins/docker-compose
+            chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
+            docker compose version
+          else
+            echo "Docker Compose V2 plugin already available:"
+            docker compose version
+          fi
+          
+          # Also install standalone Docker Compose V1 for compatibility
+          if ! command -v docker-compose &>/dev/null; then
+            echo "Docker Compose V1 not found, installing..."
+            sudo curl -SL "https://github.com/docker/compose/releases/download/v1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+            docker-compose --version
+          else
+            echo "Docker Compose V1 already available:"
+            docker-compose --version
+          fi
+      
+      - name: Generate version tag
+        id: version
+        run: |
+          SHORT_SHA="${{ github.sha }}"
+          VERSION_TAG=$(date +%Y%m%d)-${SHORT_SHA:0:8}
+          echo "version_tag=$VERSION_TAG" >> $GITHUB_OUTPUT
+      
+      - name: Build External Base Image
+        run: |
+          # Build the external dependencies image
+          echo "Building biogears-external image..."
+          docker build -t ghcr.io/${{ github.repository_owner }}/biogears-external:${{ steps.version.outputs.version_tag }} -f docker/external/Dockerfile docker/external
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-external:${{ steps.version.outputs.version_tag }} ghcr.io/${{ github.repository_owner }}/biogears-external:latest
+          
+          # Push to GitHub Container Registry
+          docker push ghcr.io/${{ github.repository_owner }}/biogears-external:${{ steps.version.outputs.version_tag }}
+          docker push ghcr.io/${{ github.repository_owner }}/biogears-external:latest
+      
+      - name: Build BioGears
+        run: |
+          if [ -f "docker-compose.yml" ]; then
+            echo "Building with docker-compose..."
+            
+            # Update docker-compose.yml to use GHCR
+            sed -i 's|image: biogears-external|image: ghcr.io/${{ github.repository_owner }}/biogears-external:${{ steps.version.outputs.version_tag }}|g' docker-compose.yml
+            sed -i 's|image: biogears-builder|image: ghcr.io/${{ github.repository_owner }}/biogears-builder:${{ steps.version.outputs.version_tag }}|g' docker-compose.yml
+            
+            # Build using Docker Compose
+            docker compose build biogears-builder
+            
+            # Tag with latest
+            docker tag ghcr.io/${{ github.repository_owner }}/biogears-builder:${{ steps.version.outputs.version_tag }} ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+            
+            # Push to GitHub Container Registry
+            docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:${{ steps.version.outputs.version_tag }}
+            docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+          else
+            echo "No docker-compose.yml found, building directly with Docker..."
+            
+            # Check if we have a builder Dockerfile
+            if [ -f "docker/release/Dockerfile" ]; then
+              echo "Using docker/release/Dockerfile..."
+              docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:${{ steps.version.outputs.version_tag }} \
+                --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:${{ steps.version.outputs.version_tag }} \
+                -f docker/release/Dockerfile .
+            else
+              # Try to find another suitable Dockerfile
+              echo "Using docker builder directory..."
+              for df in $(find docker -name "Dockerfile" | grep -v external); do
+                echo "Found Dockerfile: $df"
+                docker build -t ghcr.io/${{ github.repository_owner }}/biogears-builder:${{ steps.version.outputs.version_tag }} \
+                  --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-external:${{ steps.version.outputs.version_tag }} \
+                  -f $df .
+                break
+              done
+            fi
+            
+            # Tag with latest
+            docker tag ghcr.io/${{ github.repository_owner }}/biogears-builder:${{ steps.version.outputs.version_tag }} ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+            
+            # Push to GitHub Container Registry
+            docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:${{ steps.version.outputs.version_tag }}
+            docker push ghcr.io/${{ github.repository_owner }}/biogears-builder:latest
+          fi
+      
+      - name: Set job outputs
+        id: set-outputs
+        run: |
+          echo "external_image=ghcr.io/${{ github.repository_owner }}/biogears-external" >> $GITHUB_OUTPUT
+          echo "builder_image=ghcr.io/${{ github.repository_owner }}/biogears-builder" >> $GITHUB_OUTPUT
+          echo "version_tag=${{ steps.version.outputs.version_tag }}" >> $GITHUB_OUTPUT
+  
+  scan-external-image:
+    name: Scan External Image
+    needs: docker-build
+    uses: ./.github/workflows/reusable-sbom-scan.yml
+    with:
+      image_name: ${{ needs.docker-build.outputs.external_image }}
+      tag: ${{ needs.docker-build.outputs.version_tag }}
+      sbom_format: "cyclonedx"
+      critical_threshold: 0
+      high_threshold: 10
+      medium_threshold: 30
+      upload_artifacts: true
+      fail_on_vulnerability: false
+  
+  scan-builder-image:
+    name: Scan Builder Image
+    needs: docker-build
+    uses: ./.github/workflows/reusable-sbom-scan.yml
+    with:
+      image_name: ${{ needs.docker-build.outputs.builder_image }}
+      tag: ${{ needs.docker-build.outputs.version_tag }}
+      sbom_format: "cyclonedx"
+      critical_threshold: 0
+      high_threshold: 10
+      medium_threshold: 30
+      upload_artifacts: true
+      fail_on_vulnerability: false
+  
+  generate-and-sign-policies:
+    name: Generate and Sign OPA Policies
+    runs-on: ubuntu-latest
+    needs: docker-build
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Install OPA and Cosign
+        run: |
+          # Install OPA
+          curl -L -o opa https://github.com/open-policy-agent/opa/releases/latest/download/opa_linux_amd64
+          chmod 755 opa
+          sudo mv opa /usr/local/bin/opa
+          opa version
+          
+          # Install Cosign
+          curl -L -o cosign https://github.com/sigstore/cosign/releases/download/v2.1.1/cosign-linux-amd64
+          chmod +x cosign
+          sudo mv cosign /usr/local/bin/cosign
+          cosign version
+      
+      - name: Create policy directory
+        run: |
+          mkdir -p policies/rego
+          mkdir -p policies/signed
+      
+      - name: Generate Rego policies
+        run: |
+          # Create SBOM policy
+          cat > policies/rego/sbom_policy.rego << 'EOF'
+          package sbom
+
+          # SBOM must be in CycloneDX format
+          valid_format {
+              input.bomFormat == "CycloneDX"
+          }
+
+          # SBOM must have a version specified
+          has_version {
+              input.specVersion != null
+              input.specVersion != ""
+          }
+
+          # SBOM must have components
+          has_components {
+              count(input.components) > 0
+          }
+
+          # Verify SBOM has metadata
+          has_metadata {
+              input.metadata != null
+          }
+
+          # Check if there are any critical vulnerabilities
+          has_critical_vulnerabilities {
+              some component, vulnerability
+              input.components[component].vulnerabilities[vulnerability].severity == "critical"
+          }
+
+          # Deny if there are critical vulnerabilities
+          deny[msg] {
+              has_critical_vulnerabilities
+              msg := "SBOM contains components with critical vulnerabilities"
+          }
+
+          # SBOM is valid if it passes all validation checks
+          valid {
+              valid_format
+              has_version
+              has_components
+              has_metadata
+          }
+          EOF
+
+          # Create container scan policy
+          cat > policies/rego/container_scan_policy.rego << 'EOF'
+          package container_scan
+
+          # Maximum allowed counts for different vulnerability severities
+          max_critical = 0
+          max_high = 10
+          max_medium = 30
+
+          # Count vulnerabilities by severity
+          critical_count = count {
+              count = count([v | v = input.Results[_].Vulnerabilities[_]; v.Severity == "CRITICAL"])
+          }
+
+          high_count = count {
+              count = count([v | v = input.Results[_].Vulnerabilities[_]; v.Severity == "HIGH"])
+          }
+
+          medium_count = count {
+              count = count([v | v = input.Results[_].Vulnerabilities[_]; v.Severity == "MEDIUM"])
+          }
+
+          # Vulnerability policy violations
+          violations[msg] {
+              critical_count > max_critical
+              msg := sprintf("Critical vulnerabilities found: %d (maximum allowed: %d)", [critical_count, max_critical])
+          }
+
+          violations[msg] {
+              high_count > max_high
+              msg := sprintf("High vulnerabilities found: %d (maximum allowed: %d)", [high_count, max_high])
+          }
+
+          violations[msg] {
+              medium_count > max_medium
+              msg := sprintf("Medium vulnerabilities found: %d (maximum allowed: %d)", [medium_count, max_medium])
+          }
+
+          # Image scan is compliant if there are no violations
+          compliant {
+              count(violations) == 0
+          }
+          EOF
+      
+      - name: Sign policies
+        run: |
+          # Generate keypair
+          cosign generate-key-pair
+          
+          # Sign each policy
+          for policy_file in policies/rego/*.rego; do
+            filename=$(basename "$policy_file")
+            cosign sign-blob --key cosign.key "$policy_file" > "policies/signed/$filename.sig"
+          done
+          
+          # Create archive of policies and signatures
+          tar -czvf signed-policies.tar.gz policies/ cosign.pub
+      
+      - name: Upload signed policies
+        uses: actions/upload-artifact@v3
+        with:
+          name: signed-policies
+          path: signed-policies.tar.gz
+  
+  publish-artifacts:
+    name: Publish Artifacts
+    needs: [docker-build, scan-external-image, scan-builder-image, generate-and-sign-policies]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Download policy artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: signed-policies
+          path: ./
+      
+      - name: Download SBOM artifacts for external image
+        uses: actions/download-artifact@v3
+        with:
+          name: sbom-and-vulnerability-reports-${{ needs.docker-build.outputs.version_tag }}
+          path: sbom-external/
+      
+      - name: Download SBOM artifacts for builder image
+        uses: actions/download-artifact@v3
+        with:
+          name: sbom-and-vulnerability-reports-${{ needs.docker-build.outputs.version_tag }}
+          path: sbom-builder/
+      
+      - name: Install ORAS
+        run: |
+          curl -LO https://github.com/oras-project/oras/releases/download/v1.1.0/oras_1.1.0_linux_amd64.tar.gz
+          mkdir -p oras-install/
+          tar -zxf oras_1.1.0_linux_amd64.tar.gz -C oras-install/
+          sudo mv oras-install/oras /usr/local/bin/
+          oras version
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Publish artifacts with ORAS
+        run: |
+          # Set version info from needs context
+          VERSION="${{ needs.docker-build.outputs.version_tag }}"
+          
+          # Extract the archives
+          mkdir -p extracted
+          tar -xzf signed-policies.tar.gz -C extracted/
+          
+          # Prepare artifacts for publishing
+          mkdir -p artifacts/{sboms,policies,signatures}
+          
+          # Copy SBOMs to artifacts directory
+          cp sbom-external/sbom-reports/*.cyclonedx.json artifacts/sboms/ || true
+          cp sbom-builder/sbom-reports/*.cyclonedx.json artifacts/sboms/ || true
+          
+          # Copy policies to artifacts directory
+          cp extracted/policies/rego/*.rego artifacts/policies/ || true
+          
+          # Copy signatures to artifacts directory
+          cp extracted/policies/signed/*.sig artifacts/signatures/ || true
+          
+          # Create archives for ORAS
+          tar -czf sbom-artifacts.tar.gz -C artifacts/sboms .
+          tar -czf policy-artifacts.tar.gz -C artifacts/policies .
+          tar -czf signature-artifacts.tar.gz -C artifacts/signatures .
+          
+          # Push artifacts to registry
+          REPOSITORY="ghcr.io/${{ github.repository_owner }}/biogears-artifacts"
+          
+          echo "Pushing SBOM artifacts..."
+          oras push "${REPOSITORY}:sbom-${VERSION}" sbom-artifacts.tar.gz:application/vnd.cyclonedx+json
+          
+          echo "Pushing policy artifacts..."
+          oras push "${REPOSITORY}:policy-${VERSION}" policy-artifacts.tar.gz:application/vnd.openpolicyagent.rego
+          
+          echo "Pushing signature artifacts..."
+          oras push "${REPOSITORY}:signature-${VERSION}" signature-artifacts.tar.gz:application/vnd.dev.cosign.simplesigning.v1+json
+      
+      - name: Generate summary report
+        run: |
+          cat > biogears-pipeline-report.md << EOF
+          # BioGears Secure Pipeline Report
+          
+          Generated: $(date -u)
+          Version: ${{ needs.docker-build.outputs.version_tag }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          
+          ## Docker Images
+          
+          - External: ${{ needs.docker-build.outputs.external_image }}:${{ needs.docker-build.outputs.version_tag }}
+          - Builder: ${{ needs.docker-build.outputs.builder_image }}:${{ needs.docker-build.outputs.version_tag }}
+          
+          ## Pipeline Steps Completed
+          
+          - ✅ Docker Build
+          - ✅ SBOM Generation
+          - ✅ Vulnerability Scanning
+          - ✅ Policy Creation and Signing
+          - ✅ OCI Registry Publication
+          
+          ## View in GitHub Container Registry
+          
+          - https://github.com/${{ github.repository_owner }}/packages
+          EOF
+          
+          cat biogears-pipeline-report.md >> $GITHUB_STEP_SUMMARY 

@@ -1,0 +1,202 @@
+name: Reusable SBOM and Vulnerability Scan
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        required: true
+        type: string
+        description: "The full name of the image to scan (including registry)"
+      tag:
+        required: false
+        type: string
+        default: "latest"
+        description: "The tag of the image to scan"
+      sbom_format:
+        required: false
+        type: string
+        default: "cyclonedx"
+        description: "The format of the SBOM (cyclonedx or spdx)"
+      critical_threshold:
+        required: false
+        type: number
+        default: 0
+        description: "Maximum allowed critical vulnerabilities"
+      high_threshold:
+        required: false
+        type: number
+        default: 10
+        description: "Maximum allowed high vulnerabilities"
+      medium_threshold:
+        required: false
+        type: number
+        default: 30
+        description: "Maximum allowed medium vulnerabilities"
+      upload_artifacts:
+        required: false
+        type: boolean
+        default: true
+        description: "Whether to upload artifacts as GitHub workflow artifacts"
+      fail_on_vulnerability:
+        required: false
+        type: boolean
+        default: false
+        description: "Whether to fail the workflow if vulnerabilities exceed thresholds"
+
+jobs:
+  sbom-scan:
+    name: Generate SBOM and Scan for Vulnerabilities
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Install security tools
+        run: |
+          # Install Trivy
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin v0.41.0
+          trivy --version
+          
+          # Install Grype (alternative scanner)
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          grype --version
+          
+          # Install cosign
+          curl -L -o cosign https://github.com/sigstore/cosign/releases/download/v2.1.1/cosign-linux-amd64
+          chmod +x cosign
+          sudo mv cosign /usr/local/bin/cosign
+          cosign version
+          
+          # Install syft for SBOM generation
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          syft --version
+      
+      - name: Pull image for scanning
+        run: |
+          # Pull the image
+          docker pull ${{ inputs.image_name }}:${{ inputs.tag }}
+          
+          # Get image details
+          echo "Image ID: $(docker inspect ${{ inputs.image_name }}:${{ inputs.tag }} -f '{{.Id}}')"
+          
+          # Create output directory
+          mkdir -p sbom-reports
+      
+      - name: Generate SBOM with Trivy
+        run: |
+          # Generate SBOM in specified format
+          echo "Generating SBOM for ${{ inputs.image_name }}:${{ inputs.tag }} with Trivy..."
+          
+          if [ "${{ inputs.sbom_format }}" == "cyclonedx" ]; then
+            trivy image --format cyclonedx --output sbom-reports/sbom-trivy-${{ inputs.tag }}.cyclonedx.json ${{ inputs.image_name }}:${{ inputs.tag }}
+          elif [ "${{ inputs.sbom_format }}" == "spdx" ]; then
+            trivy image --format spdx-json --output sbom-reports/sbom-trivy-${{ inputs.tag }}.spdx.json ${{ inputs.image_name }}:${{ inputs.tag }}
+          else
+            # Default to both formats
+            trivy image --format cyclonedx --output sbom-reports/sbom-trivy-${{ inputs.tag }}.cyclonedx.json ${{ inputs.image_name }}:${{ inputs.tag }}
+            trivy image --format spdx-json --output sbom-reports/sbom-trivy-${{ inputs.tag }}.spdx.json ${{ inputs.image_name }}:${{ inputs.tag }}
+          fi
+      
+      - name: Generate SBOM with Syft (Alternative)
+        run: |
+          # Generate SBOM with Syft (alternative tool)
+          echo "Generating SBOM for ${{ inputs.image_name }}:${{ inputs.tag }} with Syft..."
+          
+          if [ "${{ inputs.sbom_format }}" == "cyclonedx" ]; then
+            syft ${{ inputs.image_name }}:${{ inputs.tag }} -o cyclonedx-json=sbom-reports/sbom-syft-${{ inputs.tag }}.cyclonedx.json
+          elif [ "${{ inputs.sbom_format }}" == "spdx" ]; then
+            syft ${{ inputs.image_name }}:${{ inputs.tag }} -o spdx-json=sbom-reports/sbom-syft-${{ inputs.tag }}.spdx.json
+          else
+            # Default to both formats
+            syft ${{ inputs.image_name }}:${{ inputs.tag }} -o cyclonedx-json=sbom-reports/sbom-syft-${{ inputs.tag }}.cyclonedx.json
+            syft ${{ inputs.image_name }}:${{ inputs.tag }} -o spdx-json=sbom-reports/sbom-syft-${{ inputs.tag }}.spdx.json
+          fi
+      
+      - name: Scan for vulnerabilities with Trivy
+        run: |
+          # Scan for vulnerabilities with Trivy
+          echo "Scanning ${{ inputs.image_name }}:${{ inputs.tag }} for vulnerabilities with Trivy..."
+          
+          # Generate scan report in multiple formats
+          trivy image --format json --output sbom-reports/vuln-trivy-${{ inputs.tag }}.json ${{ inputs.image_name }}:${{ inputs.tag }}
+          trivy image --format table --output sbom-reports/vuln-trivy-${{ inputs.tag }}.txt ${{ inputs.image_name }}:${{ inputs.tag }}
+          
+          # Generate HTML report for better visualization
+          trivy image --format template --template "@/usr/local/lib/trivy/templates/html.tpl" --output sbom-reports/vuln-trivy-${{ inputs.tag }}.html ${{ inputs.image_name }}:${{ inputs.tag }}
+          
+          # Generate summary
+          echo "Vulnerability summary:" > sbom-reports/summary.txt
+          CRIT_COUNT=$(trivy image --severity CRITICAL --quiet ${{ inputs.image_name }}:${{ inputs.tag }} | wc -l)
+          HIGH_COUNT=$(trivy image --severity HIGH --quiet ${{ inputs.image_name }}:${{ inputs.tag }} | wc -l)
+          MED_COUNT=$(trivy image --severity MEDIUM --quiet ${{ inputs.image_name }}:${{ inputs.tag }} | wc -l)
+          
+          echo "Critical: $CRIT_COUNT (threshold: ${{ inputs.critical_threshold }})" >> sbom-reports/summary.txt
+          echo "High: $HIGH_COUNT (threshold: ${{ inputs.high_threshold }})" >> sbom-reports/summary.txt
+          echo "Medium: $MED_COUNT (threshold: ${{ inputs.medium_threshold }})" >> sbom-reports/summary.txt
+          
+          cat sbom-reports/summary.txt
+          
+          # Check against thresholds if fail_on_vulnerability is enabled
+          if [ "${{ inputs.fail_on_vulnerability }}" == "true" ]; then
+            if [ $CRIT_COUNT -gt ${{ inputs.critical_threshold }} ]; then
+              echo "Critical vulnerabilities exceed threshold: $CRIT_COUNT > ${{ inputs.critical_threshold }}"
+              exit 1
+            fi
+            
+            if [ $HIGH_COUNT -gt ${{ inputs.high_threshold }} ]; then
+              echo "High vulnerabilities exceed threshold: $HIGH_COUNT > ${{ inputs.high_threshold }}"
+              exit 1
+            fi
+            
+            if [ $MED_COUNT -gt ${{ inputs.medium_threshold }} ]; then
+              echo "Medium vulnerabilities exceed threshold: $MED_COUNT > ${{ inputs.medium_threshold }}"
+              exit 1
+            fi
+          fi
+      
+      - name: Scan with Grype (Alternative)
+        run: |
+          # Scan with Grype (alternative scanner)
+          echo "Scanning ${{ inputs.image_name }}:${{ inputs.tag }} with Grype..."
+          
+          grype ${{ inputs.image_name }}:${{ inputs.tag }} -o json > sbom-reports/vuln-grype-${{ inputs.tag }}.json
+          grype ${{ inputs.image_name }}:${{ inputs.tag }} -o table > sbom-reports/vuln-grype-${{ inputs.tag }}.txt
+      
+      - name: Sign SBOMs and scan results
+        run: |
+          # Generate keypair for signing
+          cosign generate-key-pair
+          
+          # Sign generated SBOMs
+          for sbom_file in sbom-reports/sbom-*.json; do
+            cosign sign-blob --key cosign.key "$sbom_file" > "$sbom_file.sig"
+          done
+          
+          # Sign vulnerability reports
+          for vuln_file in sbom-reports/vuln-*.json; do
+            cosign sign-blob --key cosign.key "$vuln_file" > "$vuln_file.sig"
+          done
+          
+          # Create a tar file with all SBOMs and signatures
+          tar -czvf sbom-and-vuln-reports.tar.gz sbom-reports/ cosign.pub
+      
+      - name: Upload artifacts
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom-and-vulnerability-reports-${{ inputs.tag }}
+          path: |
+            sbom-reports/
+            sbom-and-vuln-reports.tar.gz
+            cosign.pub
+      
+      - name: Publish summary
+        run: |
+          echo "## SBOM and Vulnerability Scan Results for ${{ inputs.image_name }}:${{ inputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Vulnerability Summary" >> $GITHUB_STEP_SUMMARY
+          cat sbom-reports/summary.txt >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Generated Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- CycloneDX SBOMs" >> $GITHUB_STEP_SUMMARY
+          echo "- SPDX SBOMs" >> $GITHUB_STEP_SUMMARY
+          echo "- Vulnerability Reports" >> $GITHUB_STEP_SUMMARY
+          echo "- Digital Signatures" >> $GITHUB_STEP_SUMMARY 
