@@ -13,6 +13,11 @@ variables:
   REGISTRY_USERNAME: ${CI_REGISTRY_USER}
   REGISTRY_PASSWORD: ${CI_REGISTRY_PASSWORD}
 
+# Include ORAS publishing jobs
+include:
+  - local: .gitlab-ci/oras-publish.yml
+  - local: .gitlab-ci/gitlab-registry-publish.yml
+
 .build_template: &build_template
   stage: build
   artifacts:
@@ -607,10 +612,6 @@ signature:verify:
   artifacts:
     paths:
       - verification-report.txt
-
-# Include ORAS publishing job
-include:
-  - local: .gitlab-ci/oras-publish.yml
 
 pages:
   stage: deploy

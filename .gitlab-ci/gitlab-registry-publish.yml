@@ -1,0 +1,198 @@
+gitlab-registry-publish:
+  stage: deploy
+  image: alpine:latest
+  variables:
+    REGISTRY_URL: ${CI_REGISTRY}
+    REPOSITORY: ${CI_REGISTRY_IMAGE}
+  needs:
+    - attestation:generate
+    - signature:verify
+  before_script:
+    - apk add --no-cache curl wget jq tar gzip
+    # Install ORAS
+    - curl -LO https://github.com/oras-project/oras/releases/download/v1.2.2/oras_1.2.2_linux_amd64.tar.gz
+    - mkdir -p oras-install/
+    - tar -zxf oras_1.2.2_linux_amd64.tar.gz -C oras-install/
+    - mv oras-install/oras /usr/local/bin/
+    # Install cosign
+    - wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
+    - chmod +x cosign-linux-amd64
+    - mv cosign-linux-amd64 /usr/local/bin/cosign
+  script:
+    # Set version information
+    - |
+      # Use Git tags if available, otherwise fallback to commit SHA and date
+      GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo "")
+      if [ -n "$GIT_TAG" ]; then
+        VERSION="${GIT_TAG}"
+      else
+        SHORT_SHA="${CI_COMMIT_SHA:0:8}"
+        VERSION="$(date +%Y%m%d)-${SHORT_SHA}"
+      fi
+      echo "Using version: $VERSION"
+
+    # Login to GitLab Container Registry
+    - echo "${CI_REGISTRY_PASSWORD}" | oras login ${CI_REGISTRY} --username ${CI_REGISTRY_USER} --password-stdin
+
+    # Prepare artifacts directory
+    - |
+      mkdir -p artifacts/{sboms,attestations,signatures,policies,archives}
+      
+      # Copy SBOMs
+      cp sbom-*-with-vulns.cyclonedx.json artifacts/sboms/ || echo "No SBOM files found"
+      
+      # Copy attestations
+      cp *-intoto-*.json artifacts/attestations/ || echo "No in-toto attestations found"
+      cp *-raw.json artifacts/attestations/ || echo "No raw attestations found"
+      
+      # Extract signatures if they exist in archive
+      if [ -f "all-signatures.tar.gz" ]; then
+        mkdir -p temp-signatures
+        tar -xf all-signatures.tar.gz -C temp-signatures
+        cp -r temp-signatures/all-signatures/* artifacts/signatures/ || echo "Error extracting signatures"
+      else
+        echo "No signatures archive found, copying individual signatures"
+        mkdir -p artifacts/signatures
+        find . -name "*.sig" -exec cp {} artifacts/signatures/ \;
+      fi
+      
+      # Extract policies if they exist in archive
+      if [ -f "signed-policies.tar.gz" ]; then
+        mkdir -p temp-policies
+        tar -xf signed-policies.tar.gz -C temp-policies
+        cp -r temp-policies/policies/* artifacts/policies/ || echo "Error extracting policies"
+      else
+        echo "No policies archive found"
+        cp -r policies/rego/* artifacts/policies/ || echo "No policy files found"
+      fi
+      
+      # Create archives for pushing
+      tar -czf artifacts/archives/signatures.tar.gz -C artifacts/signatures . || echo "No signatures to archive"
+      tar -czf artifacts/archives/policies.tar.gz -C artifacts/policies . || echo "No policies to archive"
+      ls -la artifacts/archives/
+
+    # Push artifacts to GitLab Container Registry
+    - |
+      # Define standard media types
+      SBOM_TYPE="application/vnd.cyclonedx+json"
+      ATTESTATION_TYPE="application/in-toto+json"
+      SIG_TYPE="application/vnd.sigstore+tar+gzip"
+      POLICY_TYPE="application/vnd.rego+tar+gzip"
+      
+      push_with_retry() {
+        local repo=$1
+        local tag=$2
+        local file=$3
+        local type=$4
+        local attempt=1
+        local max_attempts=3
+        
+        while [ $attempt -le $max_attempts ]; do
+          echo "Attempt $attempt to push $file to $repo:$tag"
+          if oras push "${repo}:${tag}" --artifact-type "$type" "$file:$type"; then
+            echo "Successfully pushed $file to $repo:$tag"
+            return 0
+          fi
+          
+          attempt=$((attempt+1))
+          if [ $attempt -le $max_attempts ]; then
+            echo "Push failed, retrying in 5 seconds..."
+            sleep 5
+          else
+            echo "Push failed after $max_attempts attempts"
+            return 1
+          fi
+        done
+      }
+      
+      # Push SBOMs
+      for sbom in artifacts/sboms/sbom-*-with-vulns.cyclonedx.json; do
+        if [ -f "$sbom" ]; then
+          name=$(basename $sbom | sed 's/sbom-\(.*\)-with-vulns.cyclonedx.json/\1/')
+          echo "Pushing $name SBOM..."
+          push_with_retry "${REPOSITORY}/sbom" "${name}-${VERSION}" "$sbom" "$SBOM_TYPE" || echo "Failed to push $name SBOM"
+        fi
+      done
+      
+      # Push attestations
+      for file in artifacts/attestations/*-intoto-*.json; do
+        if [ -f "$file" ]; then
+          name=$(basename $file | sed 's/-intoto-/-/' | sed 's/\.json//')
+          echo "Pushing attestation: $name..."
+          push_with_retry "${REPOSITORY}/attestation" "${name}-${VERSION}" "$file" "$ATTESTATION_TYPE" || echo "Failed to push $name attestation"
+        fi
+      done
+      
+      # Push signatures bundle if it exists
+      if [ -f "artifacts/archives/signatures.tar.gz" ]; then
+        echo "Pushing signatures bundle..."
+        push_with_retry "${REPOSITORY}/signatures" "${VERSION}" \
+          artifacts/archives/signatures.tar.gz "$SIG_TYPE" || echo "Failed to push signatures bundle"
+      fi
+      
+      # Push policies bundle if it exists
+      if [ -f "artifacts/archives/policies.tar.gz" ]; then
+        echo "Pushing policies bundle..."
+        push_with_retry "${REPOSITORY}/policies" "${VERSION}" \
+          artifacts/archives/policies.tar.gz "$POLICY_TYPE" || echo "Failed to push policies bundle"
+      fi
+
+    # Create and push reference manifest
+    - |
+      # Create reference manifest pointing to all published artifacts
+      cat > reference-manifest.json << EOF
+      {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "artifactType": "application/vnd.biogears.release",
+        "config": {
+          "mediaType": "application/vnd.oci.empty.v1+json",
+          "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f6f3393a4c",
+          "size": 2
+        },
+        "annotations": {
+          "org.opencontainers.image.created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+          "org.opencontainers.image.version": "${VERSION}",
+          "org.opencontainers.image.title": "BioGears GitLab Registry Release",
+          "org.opencontainers.image.vendor": "BioGears",
+          "org.opencontainers.image.source": "${CI_PROJECT_URL}",
+          "org.opencontainers.image.revision": "${CI_COMMIT_SHA}",
+          "io.biogears.build.job": "${CI_JOB_ID}"
+        },
+        "layers": []
+      }
+      EOF
+      
+      # Push the reference manifest
+      oras push \
+        "${REPOSITORY}/release:${VERSION}-gitlab" \
+        --artifact-type "application/vnd.biogears.release" \
+        --manifest reference-manifest.json || echo "Failed to push reference manifest"
+
+    # Generate registry report
+    - |
+      echo "# GitLab Container Registry Artifacts" > gitlab-registry-report.md
+      echo "Generated: $(date -u)" >> gitlab-registry-report.md
+      echo "Version: ${VERSION}" >> gitlab-registry-report.md
+      echo "Pipeline: ${CI_PIPELINE_ID}" >> gitlab-registry-report.md
+      echo "" >> gitlab-registry-report.md
+      
+      echo "Repository: ${REPOSITORY}" >> gitlab-registry-report.md
+      
+      # List what was published
+      echo "" >> gitlab-registry-report.md
+      echo "## Published Artifacts" >> gitlab-registry-report.md
+      echo "" >> gitlab-registry-report.md
+      echo "- SBOMs" >> gitlab-registry-report.md
+      echo "- Attestations" >> gitlab-registry-report.md
+      echo "- Signatures" >> gitlab-registry-report.md
+      echo "- Policies" >> gitlab-registry-report.md
+      echo "- Reference Manifest" >> gitlab-registry-report.md
+      
+  artifacts:
+    paths:
+      - gitlab-registry-report.md
+  only:
+    - main
+    - master
+    - develop 

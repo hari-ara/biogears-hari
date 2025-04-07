@@ -1,0 +1,235 @@
+name: JFrog Registry Publishing
+
+on:
+  workflow_run:
+    workflows: ["BioGears CI"]
+    types:
+      - completed
+    branches: [main, master, develop]
+  # Also allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  jfrog-registry-publish:
+    name: Publish Artifacts to JFrog Artifactory
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          
+      - name: Download Workflow Artifacts
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: build.yml
+          workflow_conclusion: success
+          
+      - name: Set Version Information
+        run: |
+          # Use Git tags if available, otherwise fallback to commit SHA and date
+          GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo "")
+          if [ -n "$GIT_TAG" ]; then
+            VERSION="${GIT_TAG}"
+          else
+            SHORT_SHA="${{ github.sha }}"
+            VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Using version: $VERSION"
+          
+      - name: Install Required Tools
+        run: |
+          # Install ORAS
+          curl -LO https://github.com/oras-project/oras/releases/download/v1.2.2/oras_1.2.2_linux_amd64.tar.gz
+          mkdir -p oras-install/
+          tar -zxf oras_1.2.2_linux_amd64.tar.gz -C oras-install/
+          sudo mv oras-install/oras /usr/local/bin/
+          oras version
+          
+          # Install jq
+          sudo apt-get update
+          sudo apt-get install -y jq
+          
+          # Install cosign
+          wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          
+      - name: Login to JFrog Artifactory
+        run: |
+          echo "${{ secrets.JFROG_PASSWORD }}" | \
+          oras login ${{ secrets.JFROG_URL }} \
+            --username ${{ secrets.JFROG_USERNAME }} \
+            --password-stdin
+
+      - name: Prepare Artifacts Directory
+        run: |
+          mkdir -p artifacts/{sboms,attestations,signatures,policies,archives}
+          
+          # Extract all downloaded artifacts
+          find . -name "*.zip" -exec unzip -o {} \;
+          
+          # Organize artifacts into directories
+          cp sbom-files/sbom-*-with-vulns.cyclonedx.json artifacts/sboms/ || echo "No SBOM files found"
+          cp intoto-attestations/*-intoto-*.json artifacts/attestations/ || echo "No in-toto attestations found"
+          cp regular-attestations/*-raw.json artifacts/attestations/ || echo "No raw attestations found"
+          
+          # Extract tarball archives if they exist
+          if [ -f "all-signatures/all-signatures.tar.gz" ]; then
+            mkdir -p temp-signatures
+            tar -xf all-signatures/all-signatures.tar.gz -C temp-signatures
+            cp -r temp-signatures/* artifacts/signatures/
+          else
+            echo "No signatures archive found, copying individual signatures"
+            mkdir -p artifacts/signatures
+            find . -name "*.sig" -exec cp {} artifacts/signatures/ \;
+          fi
+          
+          if [ -f "signed-policies/signed-policies.tar.gz" ]; then
+            mkdir -p temp-policies
+            tar -xf signed-policies/signed-policies.tar.gz -C temp-policies
+            cp -r temp-policies/* artifacts/policies/
+          else
+            echo "No policies archive found"
+            mkdir -p artifacts/policies
+            cp -r policies/rego/* artifacts/policies/ || echo "No policy files found"
+          fi
+          
+          # Create archives for pushing
+          tar -czf artifacts/archives/signatures.tar.gz -C artifacts/signatures . || echo "No signatures to archive"
+          tar -czf artifacts/archives/policies.tar.gz -C artifacts/policies . || echo "No policies to archive"
+          ls -la artifacts/archives/
+
+      - name: Push Artifacts to JFrog Artifactory
+        run: |
+          # Define standard media types
+          SBOM_TYPE="application/vnd.cyclonedx+json"
+          ATTESTATION_TYPE="application/in-toto+json"
+          SIG_TYPE="application/vnd.sigstore+tar+gzip"
+          POLICY_TYPE="application/vnd.rego+tar+gzip"
+          
+          push_with_retry() {
+            local repo=$1
+            local tag=$2
+            local file=$3
+            local type=$4
+            local attempt=1
+            local max_attempts=3
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "Attempt $attempt to push $file to $repo:$tag"
+              if oras push "${repo}:${tag}" --artifact-type "$type" "$file:$type"; then
+                echo "Successfully pushed $file to $repo:$tag"
+                return 0
+              fi
+              
+              attempt=$((attempt+1))
+              if [ $attempt -le $max_attempts ]; then
+                echo "Push failed, retrying in 5 seconds..."
+                sleep 5
+              else
+                echo "Push failed after $max_attempts attempts"
+                return 1
+              fi
+            done
+          }
+          
+          # Set JFrog repository path (replace with your specific repository path)
+          REPOSITORY="${{ secrets.JFROG_URL }}/${{ secrets.JFROG_REPO }}/biogears"
+          
+          # Push SBOMs
+          for sbom in artifacts/sboms/sbom-*-with-vulns.cyclonedx.json; do
+            if [ -f "$sbom" ]; then
+              name=$(basename $sbom | sed 's/sbom-\(.*\)-with-vulns.cyclonedx.json/\1/')
+              echo "Pushing $name SBOM..."
+              push_with_retry "${REPOSITORY}/sbom" "${name}-${VERSION}" "$sbom" "$SBOM_TYPE" || echo "Failed to push $name SBOM"
+            fi
+          done
+          
+          # Push attestations
+          for file in artifacts/attestations/*-intoto-*.json; do
+            if [ -f "$file" ]; then
+              name=$(basename $file | sed 's/-intoto-/-/' | sed 's/\.json//')
+              echo "Pushing attestation: $name..."
+              push_with_retry "${REPOSITORY}/attestation" "${name}-${VERSION}" "$file" "$ATTESTATION_TYPE" || echo "Failed to push $name attestation"
+            fi
+          done
+          
+          # Push signatures bundle if it exists
+          if [ -f "artifacts/archives/signatures.tar.gz" ]; then
+            echo "Pushing signatures bundle..."
+            push_with_retry "${REPOSITORY}/signatures" "${VERSION}" \
+              artifacts/archives/signatures.tar.gz "$SIG_TYPE" || echo "Failed to push signatures bundle"
+          fi
+          
+          # Push policies bundle if it exists
+          if [ -f "artifacts/archives/policies.tar.gz" ]; then
+            echo "Pushing policies bundle..."
+            push_with_retry "${REPOSITORY}/policies" "${VERSION}" \
+              artifacts/archives/policies.tar.gz "$POLICY_TYPE" || echo "Failed to push policies bundle"
+          fi
+          
+      - name: Create and Push Reference Manifest
+        run: |
+          # Set JFrog repository path
+          REPOSITORY="${{ secrets.JFROG_URL }}/${{ secrets.JFROG_REPO }}/biogears"
+          
+          # Create reference manifest pointing to all published artifacts
+          cat > reference-manifest.json << EOF
+          {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": "application/vnd.biogears.release",
+            "config": {
+              "mediaType": "application/vnd.oci.empty.v1+json",
+              "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f6f3393a4c",
+              "size": 2
+            },
+            "annotations": {
+              "org.opencontainers.image.created": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+              "org.opencontainers.image.version": "${VERSION}",
+              "org.opencontainers.image.title": "BioGears JFrog Release",
+              "org.opencontainers.image.vendor": "BioGears",
+              "org.opencontainers.image.source": "${{ github.server_url }}/${{ github.repository }}",
+              "org.opencontainers.image.revision": "${{ github.sha }}",
+              "io.biogears.build.workflow": "${{ github.workflow }}",
+              "io.biogears.build.id": "${{ github.run_id }}"
+            },
+            "layers": []
+          }
+          EOF
+          
+          # Push the reference manifest
+          oras push \
+            "${REPOSITORY}/release:${VERSION}-jfrog" \
+            --artifact-type "application/vnd.biogears.release" \
+            --manifest reference-manifest.json
+
+      - name: Generate Registry Report
+        run: |
+          echo "# JFrog Artifactory Registry Artifacts" > jfrog-registry-report.md
+          echo "Generated: $(date -u)" >> jfrog-registry-report.md
+          echo "Version: ${VERSION}" >> jfrog-registry-report.md
+          echo "" >> jfrog-registry-report.md
+          
+          REPOSITORY="${{ secrets.JFROG_URL }}/${{ secrets.JFROG_REPO }}/biogears"
+          echo "Repository: ${REPOSITORY}" >> jfrog-registry-report.md
+          
+          # List what was published
+          echo "" >> jfrog-registry-report.md
+          echo "## Published Artifacts" >> jfrog-registry-report.md
+          echo "" >> jfrog-registry-report.md
+          echo "- SBOMs" >> jfrog-registry-report.md
+          echo "- Attestations" >> jfrog-registry-report.md
+          echo "- Signatures" >> jfrog-registry-report.md
+          echo "- Policies" >> jfrog-registry-report.md
+          echo "- Reference Manifest" >> jfrog-registry-report.md
+          
+      - name: Upload Registry Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: jfrog-registry-report
+          path: jfrog-registry-report.md 
