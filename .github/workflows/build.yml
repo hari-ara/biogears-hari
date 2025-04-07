@@ -1,0 +1,222 @@
+name: BioGears CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        build_type: [Release]
+        include:
+          - os: ubuntu-latest
+            install_deps: |
+              sudo apt-get update
+              sudo apt-get install -y liblog4cpp5-dev libxerces-c-dev libeigen3-dev
+              wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb
+              sudo dpkg -i xsd_4.0.0-1_amd64.deb
+          - os: macos-latest
+            install_deps: |
+              brew install log4cpp xerces-c eigen
+              # macOS doesn't have CodeSynthesis XSD in brew, might need to build from source or use an alternative
+          - os: windows-latest
+            install_deps: |
+              # On Windows, dependencies would be handled through vcpkg or other package managers
+              # This is a placeholder for Windows-specific dependency installation
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Install dependencies
+      run: ${{ matrix.install_deps }}
+
+    - name: Create Build Environment
+      run: cmake -E make_directory ${{github.workspace}}/build
+
+    - name: Configure CMake
+      working-directory: ${{github.workspace}}/build
+      run: cmake ${{github.workspace}} -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      run: cmake --build . --config ${{ matrix.build_type }}
+
+    - name: Test
+      working-directory: ${{github.workspace}}/build
+      run: ctest -C ${{ matrix.build_type }} --output-on-failure
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    outputs:
+      image-external: biogears-external
+      image-builder: biogears-builder
+      image-webgen: biogears-webgen
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+
+    - name: Build external dependencies
+      run: docker build -t biogears-external -f docker/external/Dockerfile docker/external
+
+    - name: Build with Docker
+      run: |
+        docker-compose up biogears-builder
+        docker-compose up biogears-webgen
+        
+  trivy-scan:
+    name: Trivy Container Scan
+    needs: docker-build
+    runs-on: ubuntu-latest
+    outputs:
+      external-scan: trivy-results-external.json
+      builder-scan: trivy-results-builder.json
+      webgen-scan: trivy-results-webgen.json
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Build images for scanning
+        run: |
+          docker build -t biogears-external -f docker/external/Dockerfile docker/external
+          docker-compose build biogears-builder
+          docker-compose build biogears-webgen
+
+      - name: Run Trivy vulnerability scanner on external image (SARIF)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'biogears-external'
+          format: 'sarif'
+          output: 'trivy-results-external.sarif'
+          severity: 'CRITICAL,HIGH'
+          
+      - name: Run Trivy vulnerability scanner on external image (JSON)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'biogears-external'
+          format: 'json'
+          output: 'trivy-results-external.json'
+          
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results-external.sarif'
+          category: 'trivy-external'
+          
+      - name: Scan builder image (SARIF)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'biogears-builder'
+          format: 'sarif'
+          output: 'trivy-results-builder.sarif'
+          severity: 'CRITICAL,HIGH'
+          
+      - name: Scan builder image (JSON)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'biogears-builder'
+          format: 'json'
+          output: 'trivy-results-builder.json'
+          
+      - name: Upload builder scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results-builder.sarif'
+          category: 'trivy-builder'
+          
+      - name: Scan webgen image (SARIF)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'biogears-webgen'
+          format: 'sarif'
+          output: 'trivy-results-webgen.sarif'
+          severity: 'CRITICAL,HIGH'
+          
+      - name: Scan webgen image (JSON)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'biogears-webgen'
+          format: 'json'
+          output: 'trivy-results-webgen.json'
+          
+      - name: Upload webgen scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results-webgen.sarif'
+          category: 'trivy-webgen'
+      
+      - name: Upload Trivy JSON reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: trivy-reports
+          path: |
+            trivy-results-*.json
+          
+  generate-sbom:
+    name: Generate SBOM
+    needs: trivy-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Download Trivy reports
+        uses: actions/download-artifact@v3
+        with:
+          name: trivy-reports
+        
+      - name: Build images for SBOM
+        run: |
+          docker build -t biogears-external -f docker/external/Dockerfile docker/external
+          docker-compose build biogears-builder
+          docker-compose build biogears-webgen
+          
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          
+      - name: Install cyclonedx-cli
+        run: |
+          CDXCLI_VERSION=0.24.0
+          wget https://github.com/CycloneDX/cyclonedx-cli/releases/download/v${CDXCLI_VERSION}/cyclonedx-linux-x64 -O /usr/local/bin/cyclonedx
+          chmod +x /usr/local/bin/cyclonedx
+          
+      - name: Generate CycloneDX SBOM for external image
+        run: syft biogears-external -o cyclonedx-json=sbom-external.cyclonedx.json
+        
+      - name: Generate CycloneDX SBOM for builder image
+        run: syft biogears-builder -o cyclonedx-json=sbom-builder.cyclonedx.json
+        
+      - name: Generate CycloneDX SBOM for webgen image
+        run: syft biogears-webgen -o cyclonedx-json=sbom-webgen.cyclonedx.json
+        
+      - name: Merge Trivy results into SBOMs
+        run: |
+          # Merge vulnerabilities into external image SBOM
+          cyclonedx merge --input-files sbom-external.cyclonedx.json trivy-results-external.json --output-file sbom-external-with-vulns.cyclonedx.json
+          
+          # Merge vulnerabilities into builder image SBOM
+          cyclonedx merge --input-files sbom-builder.cyclonedx.json trivy-results-builder.json --output-file sbom-builder-with-vulns.cyclonedx.json
+          
+          # Merge vulnerabilities into webgen image SBOM
+          cyclonedx merge --input-files sbom-webgen.cyclonedx.json trivy-results-webgen.json --output-file sbom-webgen-with-vulns.cyclonedx.json
+        
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom-files
+          path: |
+            sbom-*-with-vulns.cyclonedx.json 

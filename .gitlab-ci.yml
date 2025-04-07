@@ -1,0 +1,158 @@
+stages:
+  - build
+  - test
+  - security
+  - deploy
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+  BUILD_TYPE: Release
+
+.build_template: &build_template
+  stage: build
+  artifacts:
+    paths:
+      - build/
+
+.test_template: &test_template
+  stage: test
+  dependencies:
+    - build:$OS
+  artifacts:
+    paths:
+      - build/outputs/
+    reports:
+      junit: build/test-results.xml
+
+build:linux:
+  <<: *build_template
+  image: ubuntu:20.04
+  variables:
+    OS: linux
+  before_script:
+    - apt-get update
+    - apt-get install -y cmake git build-essential wget liblog4cpp5-dev libxerces-c-dev libeigen3-dev
+    - wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb
+    - dpkg -i xsd_4.0.0-1_amd64.deb
+  script:
+    - mkdir -p build
+    - cd build
+    - cmake .. -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+    - cmake --build . --parallel $(nproc)
+
+test:linux:
+  <<: *test_template
+  image: ubuntu:20.04
+  variables:
+    OS: linux
+  before_script:
+    - apt-get update
+    - apt-get install -y cmake git build-essential liblog4cpp5-dev libxerces-c-dev libeigen3-dev
+  script:
+    - cd build
+    - ctest -C $BUILD_TYPE --output-on-failure --parallel $(nproc)
+    - ctest -C $BUILD_TYPE --output-on-failure -T test || true
+
+build:docker:
+  stage: build
+  image: docker:20.10
+  services:
+    - docker:20.10-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache docker-compose
+  script:
+    - docker build -t biogears-external -f docker/external/Dockerfile docker/external
+    - docker-compose up -d biogears-builder
+    - docker-compose logs -f biogears-builder
+    - docker wait $(docker-compose ps -q biogears-builder)
+    - docker-compose up -d biogears-webgen
+    - docker-compose logs -f biogears-webgen
+    - docker wait $(docker-compose ps -q biogears-webgen)
+  artifacts:
+    paths:
+      - docker-compose.yml
+
+trivy:container-scan:
+  stage: security
+  image: 
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  services:
+    - docker:20.10-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  dependencies:
+    - build:docker
+  before_script:
+    - apk add --no-cache docker-compose
+    - docker build -t biogears-external -f docker/external/Dockerfile docker/external
+    - docker-compose build biogears-builder
+    - docker-compose build biogears-webgen
+  script:
+    - trivy image --format json --output trivy-external.json biogears-external
+    - trivy image --format json --output trivy-builder.json biogears-builder
+    - trivy image --format json --output trivy-webgen.json biogears-webgen
+    - trivy image --format template --template "@/contrib/gitlab.tpl" --output gl-container-scanning-report.json biogears-external
+  artifacts:
+    paths:
+      - trivy-*.json
+    reports:
+      container_scanning: gl-container-scanning-report.json
+
+sbom:generate:
+  stage: security
+  image:
+    name: anchore/syft:latest
+    entrypoint: [""]
+  services:
+    - docker:20.10-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  dependencies:
+    - build:docker
+    - trivy:container-scan
+  before_script:
+    - apk add --no-cache docker-compose wget
+    - docker build -t biogears-external -f docker/external/Dockerfile docker/external
+    - docker-compose build biogears-builder
+    - docker-compose build biogears-webgen
+    - wget https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.24.0/cyclonedx-linux-x64 -O /usr/local/bin/cyclonedx
+    - chmod +x /usr/local/bin/cyclonedx
+  script:
+    - syft biogears-external -o cyclonedx-json=sbom-external.cyclonedx.json
+    - syft biogears-builder -o cyclonedx-json=sbom-builder.cyclonedx.json
+    - syft biogears-webgen -o cyclonedx-json=sbom-webgen.cyclonedx.json
+    
+    # Convert Trivy output to CycloneDX format (if needed)
+    - wget https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.24.0/cyclonedx-linux-x64 -O /usr/local/bin/cyclonedx
+    - chmod +x /usr/local/bin/cyclonedx
+    
+    # Merge vulnerabilities into SBOMs
+    - cyclonedx merge --input-files sbom-external.cyclonedx.json trivy-external.json --output-file sbom-external-with-vulns.cyclonedx.json
+    - cyclonedx merge --input-files sbom-builder.cyclonedx.json trivy-builder.json --output-file sbom-builder-with-vulns.cyclonedx.json
+    - cyclonedx merge --input-files sbom-webgen.cyclonedx.json trivy-webgen.json --output-file sbom-webgen-with-vulns.cyclonedx.json
+  artifacts:
+    paths:
+      - sbom-*-with-vulns.cyclonedx.json
+
+pages:
+  stage: deploy
+  image: ubuntu:20.04
+  before_script:
+    - apt-get update
+    - apt-get install -y cmake git build-essential liblog4cpp5-dev libxerces-c-dev libeigen3-dev
+  script:
+    - cd build
+    - mkdir -p public
+    - cp -r outputs/doc/html/* public/
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+    - master 
