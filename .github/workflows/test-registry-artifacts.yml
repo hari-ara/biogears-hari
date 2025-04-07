@@ -431,6 +431,11 @@ jobs:
       
       - name: Download Artifacts
         uses: actions/download-artifact@v3
+        
+      - name: List Downloaded Artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          find . -type f -name "*.*" | sort
       
       - name: Install OPA and Cosign
         run: |
@@ -444,16 +449,26 @@ jobs:
           chmod +x cosign-linux-amd64
           sudo mv cosign-linux-amd64 /usr/local/bin/cosign
       
-      - name: Extract Artifacts
+      - name: Create Build Metadata
         run: |
-          # Extract policies
-          mkdir -p temp-policies
-          tar -xf signed-policies/signed-policies.tar.gz -C temp-policies
-          cp -r temp-policies/policies .
-          
-          # Create image metadata files
-          cat image-digests/image-digests.txt
-          source image-digests/image-digests.txt
+          # Create build metadata
+          cat > build-metadata.json << EOF
+          {
+            "builder_id": "github-actions",
+            "build_type": "Release",
+            "source_repo": "${{ github.server_url }}/${{ github.repository }}",
+            "commit_hash": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "build_platform": "linux"
+          }
+          EOF
+      
+      - name: Create Image Data Files
+        run: |
+          # Read image digests
+          EXTERNAL_DIGEST=$(cat image-digests/image-digests.txt | grep EXTERNAL_DIGEST | cut -d= -f2)
+          BUILDER_DIGEST=$(cat image-digests/image-digests.txt | grep BUILDER_DIGEST | cut -d= -f2)
+          WEBGEN_DIGEST=$(cat image-digests/image-digests.txt | grep WEBGEN_DIGEST | cut -d= -f2)
           
           # Create image metadata files for in-toto attestations
           cat > external-image-data.json << EOF
@@ -476,21 +491,13 @@ jobs:
             "image_digest": "${WEBGEN_DIGEST}"
           }
           EOF
-          
-          # Create build metadata
-          cat > build-metadata.json << EOF
-          {
-            "builder_id": "github-actions",
-            "build_type": "Release",
-            "source_repo": "${{ github.server_url }}/${{ github.repository }}",
-            "commit_hash": "${{ github.sha }}",
-            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "build_platform": "linux"
-          }
-          EOF
       
       - name: Generate Attestations
         run: |
+          # Create the signed-policies directory structure
+          mkdir -p policies/rego
+          cp -r signed-policies/policies/rego/* policies/rego/ || echo "Could not copy policies"
+          
           # Generate Regular Attestations
           opa eval -i build-metadata.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.attestation" -f json > build-attestation-raw.json
           
@@ -579,6 +586,11 @@ jobs:
       
       - name: Download Artifacts
         uses: actions/download-artifact@v3
+        
+      - name: List Downloaded Artifacts
+        run: |
+          echo "Downloaded artifacts for publishing:"
+          find . -type f -name "*.*" | sort
       
       - name: Install Required Tools
         run: |
@@ -734,11 +746,11 @@ jobs:
         id: sbom_digests
         run: |
           REPOSITORY="${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
-          SBOM_EXTERNAL_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/sbom:external-${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest')
-          SBOM_BUILDER_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/sbom:builder-${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest')
-          SBOM_WEBGEN_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/sbom:webgen-${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest')
-          SIGNATURES_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/signatures:${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest')
-          POLICIES_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/policies:${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest')
+          SBOM_EXTERNAL_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/sbom:external-${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest' || echo "sha256:unknown")
+          SBOM_BUILDER_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/sbom:builder-${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest' || echo "sha256:unknown")
+          SBOM_WEBGEN_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/sbom:webgen-${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest' || echo "sha256:unknown")
+          SIGNATURES_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/signatures:${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest' || echo "sha256:unknown")
+          POLICIES_DIGEST=$(oras discover -o json "ghcr.io/${REPOSITORY}/policies:${VERSION}" 2>/dev/null | jq -r '.manifests[0].digest' || echo "sha256:unknown")
           
           echo "SBOM_EXTERNAL_DIGEST=$SBOM_EXTERNAL_DIGEST" >> $GITHUB_ENV
           echo "SBOM_BUILDER_DIGEST=$SBOM_BUILDER_DIGEST" >> $GITHUB_ENV
@@ -750,8 +762,8 @@ jobs:
         run: |
           REPOSITORY="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-test"
           
-          # Load digests from image-digests.txt
-          source image-digests/image-digests.txt
+          # Read image digests
+          EXTERNAL_DIGEST=$(cat image-digests/image-digests.txt | grep EXTERNAL_DIGEST | cut -d= -f2)
           
           # Create reference manifest pointing to all published artifacts
           cat > reference-manifest.json << EOF
