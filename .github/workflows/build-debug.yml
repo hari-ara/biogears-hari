@@ -1,0 +1,147 @@
+name: BioGears Build Debug
+
+on:
+  push:
+    branches: [ haritest ]
+  workflow_dispatch:
+
+jobs:
+  diagnose-build:
+    name: Diagnose Build Issues
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      
+      - name: System info
+        run: |
+          # Check system resources
+          cat /proc/cpuinfo | grep "model name" | head -1
+          free -h
+          df -h
+          
+          # Check compiler versions
+          gcc --version
+          g++ --version
+          cmake --version
+      
+      - name: Install dependencies with verbose output
+        run: |
+          echo "Installing build dependencies..."
+          set -x  # Enable verbose mode
+          
+          sudo apt-get update
+          
+          # Install compiler and build tools
+          sudo apt-get install -y cmake build-essential
+          
+          # Install BioGears dependencies
+          sudo apt-get install -y liblog4cpp5-dev libxerces-c-dev libeigen3-dev
+          
+          # Check if dependencies were installed correctly
+          dpkg -l | grep -E 'cmake|build-essential|log4cpp|xerces|eigen'
+          
+          # Install CodeSynthesis XSD
+          wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb
+          sudo dpkg -i xsd_4.0.0-1_amd64.deb
+          xsd --version || echo "XSD not installed properly"
+          
+          set +x  # Disable verbose mode
+      
+      - name: Examine repository structure
+        run: |
+          # List directory structure
+          echo "Top-level directories and files:"
+          ls -la
+          
+          echo "CMake files:"
+          find . -name "CMakeLists.txt" | head -10
+          
+          echo "Contents of main CMakeLists.txt:"
+          cat CMakeLists.txt
+      
+      - name: Configure CMake with verbose output
+        run: |
+          mkdir -p build
+          cd build
+          cmake --version
+          
+          echo "Configuring CMake..."
+          # Use verbose logging
+          cmake -DCMAKE_VERBOSE_MAKEFILE=ON -DCMAKE_BUILD_TYPE=Release .. || {
+            # If cmake fails, print the CMake error log
+            echo "CMake configuration failed! Contents of CMakeError.log:"
+            cat CMakeFiles/CMakeError.log || echo "No CMakeError.log found"
+            exit 1
+          }
+      
+      - name: Build first target only
+        run: |
+          cd build
+          echo "Building first target only..."
+          # Try to build only the first target instead of everything
+          # Find the first target
+          FIRST_TARGET=$(cmake --build . --target help | grep -v "^All " | grep "^[[:alnum:]]" | head -1 | awk '{print $1}')
+          echo "First target is: $FIRST_TARGET"
+          
+          # Build just that target with verbose output
+          cmake --build . --target $FIRST_TARGET --verbose || {
+            echo "Build failed for first target"
+            exit 1
+          }
+      
+      - name: Attempt minimal build
+        if: ${{ always() }}
+        run: |
+          cd build
+          echo "Attempting minimal build..."
+          # Try building with minimal configuration
+          # Using -j1 to limit parallelism which sometimes causes problems
+          cmake --build . -j1 --target help
+          
+          # List available targets
+          cmake --build . --target help > available_targets.txt
+          cat available_targets.txt
+          
+          # Try to find some key library targets to build
+          grep -E 'lib|engine|core' available_targets.txt > core_targets.txt || echo "No core targets found"
+          
+          if [ -s core_targets.txt ]; then
+            # Try to build the first core target
+            CORE_TARGET=$(head -1 core_targets.txt | awk '{print $1}')
+            echo "Attempting to build core target: $CORE_TARGET"
+            cmake --build . --target $CORE_TARGET -j1 || echo "Failed to build $CORE_TARGET"
+          else
+            echo "No core targets found, attempting to build the first target"
+            FIRST_TARGET=$(head -1 available_targets.txt | awk '{print $1}')
+            [ "$FIRST_TARGET" = "All" ] && FIRST_TARGET=$(head -2 available_targets.txt | tail -1 | awk '{print $1}')
+            echo "Attempting to build: $FIRST_TARGET"
+            cmake --build . --target $FIRST_TARGET -j1 || echo "Failed to build $FIRST_TARGET"
+          fi
+      
+      - name: Check CMake logs
+        if: ${{ always() }}
+        run: |
+          cd build
+          echo "Examining CMake logs..."
+          
+          # Check for common error logs
+          for log in CMakeError.log CMakeOutput.log; do
+            if [ -f CMakeFiles/$log ]; then
+              echo "Contents of $log:"
+              cat CMakeFiles/$log
+            else
+              echo "$log not found"
+            fi
+          done
+          
+          # Check for missing dependencies
+          echo "Checking for missing dependencies..."
+          grep -r "Could NOT find" --include="*.log" .
+          
+          # Check for compilation errors
+          echo "Checking for compilation errors..."
+          grep -r "error:" --include="*.log" . 
