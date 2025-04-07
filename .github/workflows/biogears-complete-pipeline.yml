@@ -83,22 +83,37 @@ jobs:
           . ./image-digests.txt || { echo "Failed to load image-digests.txt"; cat ./image-digests.txt; exit 1; }
           
           # Try to use the project's existing Dockerfile for the builder
-          if [ -f "docker/release/Dockerfile" ]; then
+          if [ -f "docker/modified/Dockerfile.release" ]; then
+            echo "Using docker/modified/Dockerfile.release for building BioGears"
+            
+            # Create a temporary modified version that uses our external image
+            echo "Creating modified builder Dockerfile"
+            mkdir -p docker/modified
+            sed "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
+              docker/modified/Dockerfile.release > docker/modified/Dockerfile.builder
+              
+            echo "Modified Dockerfile contents:"
+            cat docker/modified/Dockerfile.builder
+            
+            # Build with the modified project Dockerfile
+            echo "Building BioGears using modified project Dockerfile..."
+            docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
+              -f docker/modified/Dockerfile.builder \
+              .
+          elif [ -f "docker/release/Dockerfile" ]; then
             echo "Using docker/release/Dockerfile for building BioGears"
             
             # Create a temporary modified version that uses our external image
             echo "Creating modified builder Dockerfile"
             mkdir -p docker/modified
-            cp docker/modified/Dockerfile.release docker/modified/Dockerfile.builder || {
-              # If our modified Dockerfile doesn't exist, create it from the original
-              sed "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
-                docker/release/Dockerfile > docker/modified/Dockerfile.builder
-              # Add artifact export commands
-              echo "RUN mkdir -p /artifacts/lib /artifacts/bin" >> docker/modified/Dockerfile.builder
-              echo "RUN make install" >> docker/modified/Dockerfile.builder
-              echo "RUN cp -r /opt/biogears/usr/lib/* /artifacts/lib/ || true" >> docker/modified/Dockerfile.builder
-              echo "RUN cp -r /opt/biogears/usr/bin/* /artifacts/bin/ || true" >> docker/modified/Dockerfile.builder
-            }
+            sed "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
+              docker/release/Dockerfile > docker/modified/Dockerfile.builder
+            
+            # Add artifact export commands
+            echo "RUN mkdir -p /artifacts/lib /artifacts/bin" >> docker/modified/Dockerfile.builder
+            echo "RUN make install" >> docker/modified/Dockerfile.builder
+            echo "RUN cp -r /opt/biogears/usr/lib/* /artifacts/lib/ || true" >> docker/modified/Dockerfile.builder
+            echo "RUN cp -r /opt/biogears/usr/bin/* /artifacts/bin/ || true" >> docker/modified/Dockerfile.builder
             
             echo "Modified Dockerfile contents:"
             cat docker/modified/Dockerfile.builder
