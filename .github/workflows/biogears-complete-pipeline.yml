@@ -80,7 +80,7 @@ jobs:
         shell: bash
         run: |
           # Use . instead of source for POSIX shell compatibility
-          . ./image-digests.txt || { echo "Failed to load image-digests.txt"; cat ./image-digests.txt; }
+          . ./image-digests.txt || { echo "Failed to load image-digests.txt"; cat ./image-digests.txt; exit 1; }
           
           # Try to use the project's existing Dockerfile for the builder
           if [ -f "docker/release/Dockerfile" ]; then
@@ -89,8 +89,16 @@ jobs:
             # Create a temporary modified version that uses our external image
             echo "Creating modified builder Dockerfile"
             mkdir -p docker/modified
-            sed "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
-              docker/release/Dockerfile > docker/modified/Dockerfile.builder
+            cp docker/modified/Dockerfile.release docker/modified/Dockerfile.builder || {
+              # If our modified Dockerfile doesn't exist, create it from the original
+              sed "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
+                docker/release/Dockerfile > docker/modified/Dockerfile.builder
+              # Add artifact export commands
+              echo "RUN mkdir -p /artifacts/lib /artifacts/bin" >> docker/modified/Dockerfile.builder
+              echo "RUN make install" >> docker/modified/Dockerfile.builder
+              echo "RUN cp -r /opt/biogears/usr/lib/* /artifacts/lib/ || true" >> docker/modified/Dockerfile.builder
+              echo "RUN cp -r /opt/biogears/usr/bin/* /artifacts/bin/ || true" >> docker/modified/Dockerfile.builder
+            }
             
             echo "Modified Dockerfile contents:"
             cat docker/modified/Dockerfile.builder
@@ -120,7 +128,7 @@ jobs:
         shell: bash
         run: |
           # Use . instead of source for POSIX shell compatibility
-          . ./image-digests.txt || { echo "Failed to load image-digests.txt"; cat ./image-digests.txt; }
+          . ./image-digests.txt || { echo "Failed to load image-digests.txt"; cat ./image-digests.txt; exit 1; }
           
           # Create a temporary container to extract artifacts from
           CONTAINER_ID=$(docker create ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest)
