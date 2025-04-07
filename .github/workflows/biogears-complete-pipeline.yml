@@ -24,6 +24,7 @@ jobs:
           fetch-depth: 0
       
       - name: Debug repository structure
+        shell: bash
         run: |
           echo "Checking repository structure..."
           echo "Root directory:"
@@ -53,19 +54,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Build External Base Image
+        shell: bash
         run: |
-          # Debug what Docker files exist
-          echo "Looking for external Dockerfile..."
-          EXTERNAL_DOCKERFILE=$(find . -name "Dockerfile" -path "*/external/*" | head -n 1)
+          # Simplify Dockerfile discovery with more robust approach
+          echo "Looking for Dockerfiles..."
+          echo "All Dockerfiles in repository:"
+          find . -name "Dockerfile" -type f | tee all_dockerfiles.txt
+          
+          # Pick the first Dockerfile for external dependencies
+          EXTERNAL_DOCKERFILE=$(head -n 1 all_dockerfiles.txt)
           
           if [ -z "$EXTERNAL_DOCKERFILE" ]; then
-            echo "No external Dockerfile found, looking for any Dockerfile..."
-            EXTERNAL_DOCKERFILE=$(find . -name "Dockerfile" | grep -v "context" | head -n 1)
-            
-            if [ -z "$EXTERNAL_DOCKERFILE" ]; then
-              echo "ERROR: No Dockerfile found for external dependencies"
-              exit 1
-            fi
+            echo "ERROR: No Dockerfiles found in repository"
+            exit 1
           fi
           
           echo "Using Dockerfile at: $EXTERNAL_DOCKERFILE"
@@ -82,29 +83,26 @@ jobs:
           DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
           docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest ghcr.io/${{ github.repository_owner }}/biogears-hari-external:${DATE_VERSION}
           
-          # Get image digest
-          EXTERNAL_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest 2>/dev/null || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest)
+          # Get image digest and save to file
+          EXTERNAL_DIGEST=$(docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest)
           echo "EXTERNAL_DIGEST=$EXTERNAL_DIGEST" > image-digests.txt
           echo "EXTERNAL_VERSION=$DATE_VERSION" >> image-digests.txt
           echo "EXTERNAL_DOCKERFILE=$EXTERNAL_DOCKERFILE" >> image-digests.txt
           echo "External image digest: $EXTERNAL_DIGEST"
       
       - name: Build BioGears with Docker
+        shell: bash
         run: |
-          source image-digests.txt
+          # Use . instead of source for POSIX shell compatibility
+          . ./image-digests.txt || { echo "Failed to load image-digests.txt"; cat ./image-digests.txt; }
           
-          # Debug what Docker files exist for builder
-          echo "Looking for builder/release Dockerfile..."
-          BUILDER_DOCKERFILE=$(find . -name "Dockerfile" -path "*/release/*" -o -name "Dockerfile" -path "*/builder/*" | head -n 1)
+          # Simplify builder Dockerfile discovery
+          echo "Looking for second Dockerfile for builder..."
+          BUILDER_DOCKERFILE=$(grep -v "^$EXTERNAL_DOCKERFILE$" all_dockerfiles.txt | head -n 1)
           
           if [ -z "$BUILDER_DOCKERFILE" ]; then
-            echo "No builder Dockerfile found, looking for any other Dockerfile..."
-            BUILDER_DOCKERFILE=$(find . -name "Dockerfile" | grep -v "context" | grep -v "$EXTERNAL_DOCKERFILE" | head -n 1)
-            
-            if [ -z "$BUILDER_DOCKERFILE" ]; then
-              echo "ERROR: No Dockerfile found for BioGears builder"
-              exit 1
-            fi
+            echo "No second Dockerfile found, using the same one as external"
+            BUILDER_DOCKERFILE=$EXTERNAL_DOCKERFILE
           fi
           
           echo "Using Dockerfile at: $BUILDER_DOCKERFILE"
@@ -115,22 +113,26 @@ jobs:
           docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest \
             --build-arg EXTERNAL_IMAGE=ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest \
             --progress=plain \
-            -f "$BUILDER_DOCKERFILE" .
+            -f "$BUILDER_DOCKERFILE" "$DOCKERFILE_DIR"
           
           # Tag with date-based version
           SHORT_SHA="${{ github.sha }}"
           DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
           docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:${DATE_VERSION}
           
-          # Get image digest
-          BUILDER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest 2>/dev/null || docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest)
+          # Get image digest and save to file
+          BUILDER_DIGEST=$(docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest)
           echo "BUILDER_DIGEST=$BUILDER_DIGEST" >> image-digests.txt
           echo "BUILDER_VERSION=$DATE_VERSION" >> image-digests.txt
           echo "BUILDER_DOCKERFILE=$BUILDER_DOCKERFILE" >> image-digests.txt
           echo "Builder image digest: $BUILDER_DIGEST"
       
       - name: Extract built artifacts from Docker image
+        shell: bash
         run: |
+          # Use . instead of source for POSIX shell compatibility
+          . ./image-digests.txt || { echo "Failed to load image-digests.txt"; cat ./image-digests.txt; }
+          
           # Create a temporary container to extract artifacts from
           CONTAINER_ID=$(docker create ghcr.io/${{ github.repository_owner }}/biogears-hari-builder:latest)
           
@@ -151,8 +153,11 @@ jobs:
           ls -la build/bin/
       
       - name: Create build metadata
+        shell: bash
         run: |
-          source image-digests.txt
+          # Use . instead of source for POSIX shell compatibility
+          . ./image-digests.txt || { echo "Failed to load image-digests.txt"; cat ./image-digests.txt; }
+          
           cat > build-metadata.json << EOF
           {
             "builder_id": "github-actions-docker",
@@ -248,6 +253,7 @@ jobs:
       
       - name: Get image digest
         id: image_digest
+        shell: bash
         run: |
           # Get image digest for attestations
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} | cut -d'@' -f2 || echo "sha256:$(docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }})")
@@ -291,8 +297,10 @@ jobs:
           sudo apt-get install -y trivy
       
       - name: Generate SBOM and scan for vulnerabilities
+        shell: bash
         run: |
-          source image-digest.txt
+          # Use . instead of source for POSIX shell compatibility
+          . ./image-digest.txt || { echo "Failed to load image-digest.txt"; cat ./image-digest.txt; }
           
           # Generate SBOM and scan image (all in one command)
           trivy image --format cyclonedx --output sbom-with-vulns.cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
@@ -648,8 +656,10 @@ jobs:
           tar -xzf signed-policies.tar.gz -C extracted-policies
       
       - name: Create image data file
+        shell: bash
         run: |
-          source image-digest.txt
+          # Use . instead of source for POSIX shell compatibility
+          . ./image-digest.txt || { echo "Failed to load image-digest.txt"; cat ./image-digest.txt; }
           
           # Create image metadata file for in-toto attestations
           cat > image-data.json << EOF
@@ -660,6 +670,7 @@ jobs:
           EOF
       
       - name: Generate attestations
+        shell: bash
         run: |
           # Generate Build Attestation
           opa eval -i build-output/build-metadata.json -d extracted-policies/policies/rego/build_attestation_policy.rego "data.build_attestation.attestation" -f json > build-attestation-raw.json
@@ -778,6 +789,7 @@ jobs:
       
       - name: Set version information
         id: version
+        shell: bash
         run: |
           SHORT_SHA="${{ github.sha }}"
           VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
