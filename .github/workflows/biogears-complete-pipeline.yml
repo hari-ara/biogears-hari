@@ -53,11 +53,6 @@ jobs:
       - name: Build External Base Image
         shell: bash
         run: |
-          # Debug architecture info
-          echo "Architecture debugging information:"
-          uname -a
-          dpkg --print-architecture || echo "dpkg not available"
-          
           # Use the project's existing Dockerfile for external dependencies
           echo "Building external dependencies using repository Dockerfile"
           
@@ -88,13 +83,6 @@ jobs:
             echo '    liblog4cpp5-dev \' >> docker/biogears/Dockerfile.external
             echo '    libeigen3-dev && \' >> docker/biogears/Dockerfile.external
             echo '    rm -rf /var/lib/apt/lists/*' >> docker/biogears/Dockerfile.external
-            echo '' >> docker/biogears/Dockerfile.external
-            # Check available packages
-            echo '# Debugging package information' >> docker/biogears/Dockerfile.external
-            echo 'RUN apt-get update && \' >> docker/biogears/Dockerfile.external
-            echo '    apt-cache search liblog4cpp && \' >> docker/biogears/Dockerfile.external
-            echo '    dpkg --print-architecture && \' >> docker/biogears/Dockerfile.external
-            echo '    echo "Debug info complete"' >> docker/biogears/Dockerfile.external
             echo '' >> docker/biogears/Dockerfile.external
             echo '# Install CodeSynthesis XSD' >> docker/biogears/Dockerfile.external
             echo 'RUN wget https://www.codesynthesis.com/download/xsd/4.0/linux-gnu/x86_64/xsd_4.0.0-1_amd64.deb && \' >> docker/biogears/Dockerfile.external
@@ -128,48 +116,18 @@ jobs:
           # Use . instead of source for POSIX shell compatibility
           . ./image-digests.txt || { echo "Failed to load image-digests.txt"; cat ./image-digests.txt; }
           
-          # Debug info
-          echo "Build BioGears with Docker - debugging information"
-          echo "Docker images:"
-          docker images
-          echo "External image digest: $EXTERNAL_DIGEST"
-          echo "Checking if external image exists:"
-          docker image inspect ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest || echo "External image not found"
-          
           # Try to use the project's existing Dockerfile for the builder
           if [ -f "docker/release/Dockerfile" ]; then
             echo "Using docker/release/Dockerfile for building BioGears"
             
-            # Add debugging output
-            echo "Original release Dockerfile contents:"
-            cat docker/release/Dockerfile
-            
             # Create a temporary modified version that uses our external image
             echo "Creating modified builder Dockerfile"
             mkdir -p docker/modified
-            
-            # Debug the sed command
-            echo "Sed version:"
-            sed --version || echo "sed --version not supported"
-            echo "Original FROM line:"
-            grep "^FROM" docker/release/Dockerfile || echo "FROM line not found"
-            
-            # Create the modified Dockerfile with more robust error handling
-            cp docker/release/Dockerfile docker/modified/Dockerfile.builder.orig
-            echo "Creating modified version manually for more reliability"
-            cat > docker/modified/Dockerfile.builder << EOF
-FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest
-$(grep -v "^FROM" docker/modified/Dockerfile.builder.orig)
-EOF
+            sed "s|^FROM biogears-external|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
+              docker/release/Dockerfile > docker/modified/Dockerfile.builder
             
             echo "Modified Dockerfile contents:"
             cat docker/modified/Dockerfile.builder
-            
-            # Add additional debug info
-            echo "Current working directory:"
-            pwd
-            echo "Available Docker images:"
-            docker images
             
             # Attempt to build with the project's Dockerfile
             echo "Building BioGears using modified project Dockerfile..."
@@ -177,7 +135,6 @@ EOF
               -f docker/modified/Dockerfile.builder \
               . || {
                 echo "Real build failed, creating dummy builder image instead"
-                echo "Docker build failed with exit code $?"
                 
                 # Create a simple builder Dockerfile that doesn't try to build the actual project
                 echo "FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest" > docker/biogears/Dockerfile.builder

@@ -1,0 +1,8 @@
+{
+  "builder_id": "local-test",
+  "build_type": "Release",
+  "source_repo": "local-test",
+  "commit_hash": "test-hash",
+  "build_timestamp": "2023-04-07T00:00:00Z",
+  "build_platform": "linux"
+}

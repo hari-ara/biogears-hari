@@ -1,0 +1,14 @@
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+# Install minimal dependencies to test syntax
+RUN apt-get update && \
+    apt-get install -y \
+    build-essential \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/biogears
+CMD ["/bin/bash"]

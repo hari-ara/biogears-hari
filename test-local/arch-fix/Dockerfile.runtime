@@ -1,0 +1,25 @@
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+# Install runtime dependencies with architecture detection
+RUN apt-get update && \
+    arch=$(dpkg --print-architecture) && \
+    echo "Detected architecture: $arch" && \
+    apt-get install -y --no-install-recommends \
+    liblog4cpp5v5 \
+    libxerces-c3.2 \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create dummy files for testing
+RUN mkdir -p /usr/local/lib /usr/local/bin /opt/biogears && \
+    echo "Dummy library" > /usr/local/lib/libbiogears.so && \
+    echo '#!/bin/bash' > /usr/local/bin/bg-cli && \
+    echo 'echo "BioGears CLI Simulator"' >> /usr/local/bin/bg-cli && \
+    chmod +x /usr/local/bin/bg-cli
+
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+ENTRYPOINT ["/bin/bash", "-c", "if [ -x /usr/local/bin/bg-cli ]; then /usr/local/bin/bg-cli; else echo BioGears CLI Simulator; fi"]
