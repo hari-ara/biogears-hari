@@ -125,6 +125,16 @@ jobs:
             echo "RUN apt-get update && apt-get install -y cmake" >> docker/modified/Dockerfile.builder
             echo "RUN cmake --version" >> docker/modified/Dockerfile.builder
             
+            # Install a newer Eigen with better C++20 compatibility
+            echo "# Remove old Eigen and install a newer version (v3.4+)" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-get remove -y libeigen3-dev && \\" >> docker/modified/Dockerfile.builder
+            echo "    git clone https://gitlab.com/libeigen/eigen.git /tmp/eigen && \\" >> docker/modified/Dockerfile.builder
+            echo "    cd /tmp/eigen && \\" >> docker/modified/Dockerfile.builder
+            echo "    git checkout 3.4.0 && \\" >> docker/modified/Dockerfile.builder
+            echo "    mkdir build && cd build && \\" >> docker/modified/Dockerfile.builder
+            echo "    cmake .. && make install && \\" >> docker/modified/Dockerfile.builder
+            echo "    rm -rf /tmp/eigen" >> docker/modified/Dockerfile.builder
+            
             # Configure CMake with advanced C++20 support for GCC-11
             echo "# Tell CMake to use C++20 standard with explicit GCC-11 configuration" >> docker/modified/Dockerfile.builder
             echo "RUN cd /opt/biogears/core/build && cmake \\" >> docker/modified/Dockerfile.builder
@@ -193,6 +203,16 @@ jobs:
             echo "RUN apt-add-repository \"deb https://apt.kitware.com/ubuntu/ \$(lsb_release -cs) main\"" >> docker/modified/Dockerfile.builder
             echo "RUN apt-get update && apt-get install -y cmake" >> docker/modified/Dockerfile.builder
             echo "RUN cmake --version" >> docker/modified/Dockerfile.builder
+            
+            # Install a newer Eigen with better C++20 compatibility
+            echo "# Remove old Eigen and install a newer version (v3.4+)" >> docker/modified/Dockerfile.builder
+            echo "RUN apt-get remove -y libeigen3-dev && \\" >> docker/modified/Dockerfile.builder
+            echo "    git clone https://gitlab.com/libeigen/eigen.git /tmp/eigen && \\" >> docker/modified/Dockerfile.builder
+            echo "    cd /tmp/eigen && \\" >> docker/modified/Dockerfile.builder
+            echo "    git checkout 3.4.0 && \\" >> docker/modified/Dockerfile.builder
+            echo "    mkdir build && cd build && \\" >> docker/modified/Dockerfile.builder
+            echo "    cmake .. && make install && \\" >> docker/modified/Dockerfile.builder
+            echo "    rm -rf /tmp/eigen" >> docker/modified/Dockerfile.builder
             
             # Configure CMake with advanced C++20 support for GCC-11
             echo "# Tell CMake to use C++20 standard with explicit GCC-11 configuration" >> docker/modified/Dockerfile.builder
