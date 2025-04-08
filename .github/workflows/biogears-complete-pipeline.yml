@@ -12,9 +12,13 @@ permissions:
   packages: write
 
 jobs:
+  #######################################
+  # STAGE 1: BUILD & PACKAGE
+  #######################################
+  
   # Build BioGears from source on Linux using Docker
   build-linux:
-    name: PHASE 1A - Build BioGears (Linux)
+    name: Build BioGears (Linux)
     runs-on: ubuntu-latest
     
     steps:
@@ -327,7 +331,7 @@ jobs:
             
   # Build Docker runtime image containing BioGears
   build-docker:
-    name: PHASE 1B - Build Docker Images
+    name: Build Docker Images
     needs: build-linux
     runs-on: ubuntu-latest
     
@@ -559,9 +563,13 @@ jobs:
           name: image-digest
           path: image-digest.txt
 
+  #######################################
+  # STAGE 2: SECURITY METADATA
+  #######################################
+  
   # Generate SBOM and scan for vulnerabilities
   security-scan:
-    name: PHASE 2A - Generate SBOM and Scan
+    name: Generate SBOM and Scan
     needs: build-docker
     runs-on: ubuntu-latest
     continue-on-error: true  # Allow this job to succeed even if it can't scan
@@ -670,7 +678,7 @@ jobs:
 
   # Create and sign policies
   create-policies:
-    name: PHASE 2B - Create and Sign Policies
+    name: Create and Sign Policies
     runs-on: ubuntu-latest
     
     steps:
@@ -956,7 +964,7 @@ jobs:
 
   # Generate attestations
   generate-attestations:
-    name: PHASE 2C - Generate Attestations
+    name: Generate Attestations
     needs: [build-linux, build-docker, security-scan, create-policies]
     runs-on: ubuntu-latest
     continue-on-error: true  # Allow this job to succeed even if it encounters issues
@@ -1375,7 +1383,7 @@ jobs:
 
   # Add comprehensive security testing phase - MOVED BEFORE publish-artifacts
   security-testing:
-    name: PHASE 3A - Security Testing & Validation
+    name: Security Testing & Validation
     needs: generate-attestations
     runs-on: ubuntu-latest
     
@@ -1663,7 +1671,7 @@ jobs:
 
   # Publish artifacts with ORAS - Updated dependency to depend on security-testing
   publish-artifacts:
-    name: PHASE 3B - Publish with ORAS
+    name: Publish with ORAS
     needs: security-testing
     runs-on: ubuntu-latest
     continue-on-error: true  # Allow this job to succeed even if there are issues
@@ -2081,7 +2089,7 @@ jobs:
 
   # Create demonstration materials for supply chain security
   create-demo-materials:
-    name: PHASE 4A - Create Security Demo Materials
+    name: Create Security Demo Materials
     needs: publish-artifacts
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -2586,7 +2594,7 @@ jobs:
 
   # Add this job after the create-demo-materials job
   run-security-demos:
-    name: PHASE 4B - Run Security Demonstrations
+    name: Run Security Demonstrations
     needs: [create-demo-materials, publish-artifacts]
     runs-on: ubuntu-latest
     
