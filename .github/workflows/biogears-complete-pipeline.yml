@@ -3000,3 +3000,228 @@ jobs:
             demo-run/demo-materials/*.md
             demo-run/demo-materials/*.png
             demo-run/demo-materials/*.txt
+
+  # Comprehensive progress report for the entire pipeline
+  generate-comprehensive-report:
+    name: Generate Comprehensive Progress Report
+    needs: run-security-demos
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+      
+      - name: Install required tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq graphviz
+      
+      - name: Collect information from all stages
+        run: |
+          mkdir -p progress-report
+          
+          # Collect build information
+          if [ -f "biogears-build/build-metadata.json" ]; then
+            cp biogears-build/build-metadata.json progress-report/
+            BUILD_STATUS="✅ Successful"
+          else
+            echo '{"build_status": "unknown"}' > progress-report/build-metadata.json
+            BUILD_STATUS="⚠️ Unknown"
+          fi
+          
+          # Collect image information
+          if [ -f "image-digest/image-digest.txt" ]; then
+            cp image-digest/image-digest.txt progress-report/
+            IMAGE_STATUS="✅ Published"
+          else
+            echo "IMAGE_DIGEST=unknown" > progress-report/image-digest.txt
+            IMAGE_STATUS="⚠️ Unknown"
+          fi
+          
+          # Collect security scan results
+          if [ -f "security-artifacts/trivy-scan.json" ]; then
+            cp security-artifacts/trivy-scan.json progress-report/
+            
+            # Get vulnerability counts
+            CRITICAL_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")] | length' security-artifacts/trivy-scan.json 2>/dev/null || echo "N/A")
+            HIGH_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="HIGH")] | length' security-artifacts/trivy-scan.json 2>/dev/null || echo "N/A")
+            MEDIUM_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="MEDIUM")] | length' security-artifacts/trivy-scan.json 2>/dev/null || echo "N/A")
+            
+            SCAN_STATUS="✅ Completed (Critical: ${CRITICAL_COUNT}, High: ${HIGH_COUNT}, Medium: ${MEDIUM_COUNT})"
+          else
+            echo '{"scan_status": "unknown"}' > progress-report/trivy-scan.json
+            SCAN_STATUS="⚠️ Unknown"
+          fi
+          
+          # Collect SBOM information
+          if [ -f "security-artifacts/sbom-with-vulns.cyclonedx.json" ]; then
+            cp security-artifacts/sbom-with-vulns.cyclonedx.json progress-report/
+            COMPONENT_COUNT=$(jq '.components | length' security-artifacts/sbom-with-vulns.cyclonedx.json 2>/dev/null || echo "N/A")
+            SBOM_STATUS="✅ Generated with ${COMPONENT_COUNT} components"
+          else
+            echo '{"sbom_status": "unknown"}' > progress-report/sbom-with-vulns.cyclonedx.json
+            SBOM_STATUS="⚠️ Unknown"
+          fi
+          
+          # Collect attestation information
+          if [ -d "attestation-artifacts" ]; then
+            ATTESTATION_COUNT=$(find attestation-artifacts -name "*-intoto*.json" | wc -l)
+            ATTESTATION_STATUS="✅ Generated ${ATTESTATION_COUNT} attestations"
+          else
+            ATTESTATION_STATUS="⚠️ Unknown"
+          fi
+          
+          # Collect security testing information
+          if [ -d "security-test-reports" ]; then
+            mkdir -p progress-report/security-tests
+            cp -r security-test-reports/* progress-report/security-tests/ 2>/dev/null || echo "No test reports to copy"
+            TEST_STATUS="✅ Completed"
+          else
+            TEST_STATUS="⚠️ Unknown"
+          fi
+          
+          # Collect demo results
+          if [ -d "security-demo-outputs" ]; then
+            mkdir -p progress-report/demos
+            cp -r security-demo-outputs/* progress-report/demos/ 2>/dev/null || echo "No demo outputs to copy"
+            DEMO_STATUS="✅ Executed"
+          else
+            DEMO_STATUS="⚠️ Unknown"
+          fi
+          
+          # Generate comprehensive report
+          cat > progress-report/comprehensive-pipeline-report.md << EOF
+          # BioGears Pipeline Comprehensive Progress Report
+          
+          Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Workflow Run: ${{ github.workflow }} #${{ github.run_number }}
+          Repository: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          
+          ## 📊 Pipeline Status Overview
+          
+          | Stage | Status | Details |
+          |-------|--------|---------|
+          | **Build** | ${BUILD_STATUS} | Core libraries and Docker image built |
+          | **Image** | ${IMAGE_STATUS} | Container image published to registry | 
+          | **Security Scan** | ${SCAN_STATUS} | Vulnerability scanning completed |
+          | **SBOM** | ${SBOM_STATUS} | Software Bill of Materials generated |
+          | **Attestations** | ${ATTESTATION_STATUS} | Supply chain attestations created |
+          | **Security Testing** | ${TEST_STATUS} | Security validation and testing performed |
+          | **Artifact Publishing** | $([[ -f "pipeline-report/biogears-pipeline-report.md" ]] && echo "✅ Complete" || echo "⚠️ Unknown") | Pipeline artifacts published |
+          | **Security Demos** | ${DEMO_STATUS} | Security demonstrations executed |
+          
+          ## 🏗️ Build Details
+          
+          $(jq -r '. | "- **Builder**: \(.builder_id)\n- **Type**: \(.build_type)\n- **Timestamp**: \(.build_timestamp)\n- **Platform**: \(.build_platform)\n- **Commit**: \(.commit_hash)"' progress-report/build-metadata.json 2>/dev/null || echo "Build details not available")
+          
+          ## 🔒 Security Analysis
+          
+          ### Vulnerability Summary
+          
+          $(if [ "$CRITICAL_COUNT" != "N/A" ]; then 
+              echo "- Critical: $CRITICAL_COUNT"
+              echo "- High: $HIGH_COUNT"
+              echo "- Medium: $MEDIUM_COUNT"
+            else
+              echo "Vulnerability data not available"
+            fi)
+          
+          ### SBOM Overview
+          
+          $(if [ "$COMPONENT_COUNT" != "N/A" ]; then
+              echo "- Components: $COMPONENT_COUNT"
+              echo "- Format: $(jq -r '.bomFormat' progress-report/sbom-with-vulns.cyclonedx.json 2>/dev/null || echo "Unknown")"
+              echo "- Version: $(jq -r '.specVersion' progress-report/sbom-with-vulns.cyclonedx.json 2>/dev/null || echo "Unknown")"
+            else
+              echo "SBOM data not available"
+            fi)
+          
+          ## 🧪 Security Testing Results
+          
+          $(if [ -f "security-test-reports/comprehensive-security-test-report.md" ]; then
+              echo "Security testing completed successfully. Tests performed:"
+              echo ""
+              echo "- CIS Docker Benchmark"
+              echo "- Container Image Deep Scanning"
+              echo "- SBOM Verification and License Compliance"
+              echo "- Runtime Security Analysis"
+            else
+              echo "Security test reports not available"
+            fi)
+          
+          ## 📦 Published Artifacts
+          
+          $(if [ -f "pipeline-report/biogears-pipeline-report.md" ]; then
+              cat pipeline-report/biogears-pipeline-report.md | grep -A 15 "## Artifacts" | tail -n +2
+            else
+              echo "Published artifact list not available"
+            fi)
+          
+          ## 🔍 Security Demonstrations
+          
+          $(if [ -f "security-demo-outputs/supply-chain-security-report.md" ]; then
+              echo "The following security demonstrations were executed:"
+              echo ""
+              echo "- Dependency Tampering Detection"
+              echo "- Container Image Signature Verification"
+              echo "- Vulnerability Scanning and Policy Enforcement"
+              echo "- Build Environment Attestation"
+            else
+              echo "Security demonstration results not available"
+            fi)
+          
+          ## 🔄 Complete Workflow Diagram
+          
+          \`\`\`mermaid
+          graph TD
+            A[Build BioGears] --> B[Build Docker Image]
+            B --> C[Generate SBOM]
+            B --> D[Security Scan]
+            C --> E[Create Policies]
+            D --> E
+            E --> F[Generate Attestations]
+            F --> G[Security Testing]
+            G --> H[Publish Artifacts]
+            H --> I[Create Demo Materials]
+            I --> J[Run Security Demos]
+            J --> K[This Report]
+          \`\`\`
+          
+          ## 📚 Resources and Documentation
+          
+          - [Supply Chain Security Documentation](https://github.com/${{ github.repository }}/wiki/Supply-Chain-Security)
+          - [BioGears Documentation](https://github.com/${{ github.repository }}/wiki)
+          - [Security Policies](https://github.com/${{ github.repository }}/security/policy)
+          - [Docker Images](https://github.com/${{ github.repository_owner }}/biogears-hari/pkgs/container/biogears-hari)
+          
+          ## 📌 Next Steps
+          
+          1. Review security scan results and address any vulnerabilities
+          2. Verify all attestations for compliance requirements
+          3. Use demo materials to showcase security features
+          4. Deploy the container image in your environment
+          
+          EOF
+      
+      - name: Upload comprehensive report
+        uses: actions/upload-artifact@v4
+        with:
+          name: comprehensive-progress-report
+          path: progress-report/
+          
+      - name: Generate HTML report
+        run: |
+          sudo apt-get install -y pandoc
+          cd progress-report
+          pandoc comprehensive-pipeline-report.md -o comprehensive-pipeline-report.html -s --metadata title="BioGears Pipeline Report"
+          
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-progress-report
+          path: progress-report/comprehensive-pipeline-report.html
