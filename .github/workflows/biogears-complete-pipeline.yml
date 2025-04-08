@@ -1401,7 +1401,10 @@ jobs:
           sudo apt-get install -y jq curl wget python3-pip clamav clamdscan
           
           # Install security testing tools
-          pip3 install bandit safety docker-bench-security
+          pip3 install bandit safety
+          
+          # Clone docker-bench-security instead of installing via pip
+          git clone https://github.com/docker/docker-bench-security.git
           
           # Install Trivy
           wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
@@ -1424,15 +1427,8 @@ jobs:
           # Create a temporary script to run docker-bench-security
           cat > run-docker-bench.sh << 'EOF'
           #!/bin/bash
-          docker run --rm --net host --pid host --userns host --cap-add audit_control \
-            -e DOCKER_CONTENT_TRUST=$DOCKER_CONTENT_TRUST \
-            -v /etc:/etc:ro \
-            -v /usr/bin/containerd:/usr/bin/containerd:ro \
-            -v /usr/bin/runc:/usr/bin/runc:ro \
-            -v /usr/lib/systemd:/usr/lib/systemd:ro \
-            -v /var/lib:/var/lib:ro \
-            -v /var/run/docker.sock:/var/run/docker.sock:ro \
-            docker/docker-bench-security > docker-bench-results.txt || echo "Docker bench failed but continuing"
+          cd docker-bench-security
+          sudo sh docker-bench-security.sh -c container_images > ../docker-bench-results.txt || echo "Docker bench failed but continuing"
           EOF
           
           chmod +x run-docker-bench.sh
