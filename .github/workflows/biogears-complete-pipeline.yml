@@ -738,8 +738,8 @@ jobs:
           # Use . instead of source for POSIX shell compatibility
           . ./image-digest.txt || { echo "Failed to load image-digest.txt"; cat ./image-digest.txt; }
           
-          # Generate SBOM and scan image (all in one command)
-          echo "Generating SBOM for container image..."
+          # Generate SBOM and scan standard image (all in one command)
+          echo "Generating SBOM for standard container image..."
           trivy image --format cyclonedx --output sbom-with-vulns.cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} || {
             echo "Failed to generate SBOM, creating minimal SBOM..."
             cat > sbom-with-vulns.cyclonedx.json << EOF
@@ -774,8 +774,44 @@ jobs:
           EOF
           }
           
-          # Also generate JSON format scan results for policy evaluation
-          echo "Generating vulnerability scan report..."
+          # Generate SBOM and scan distroless image
+          echo "Generating SBOM for distroless container image..."
+          trivy image --format cyclonedx --output sbom-distroless-with-vulns.cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless || {
+            echo "Failed to generate distroless SBOM, creating minimal SBOM..."
+            cat > sbom-distroless-with-vulns.cyclonedx.json << EOF
+          {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.4",
+            "serialNumber": "urn:uuid:$(uuidgen)",
+            "version": 1,
+            "metadata": {
+              "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+              "tools": [
+                {
+                  "vendor": "GitHub",
+                  "name": "GitHub Actions",
+                  "version": "workflow"
+                }
+              ],
+              "component": {
+                "type": "container",
+                "name": "biogears-hari-distroless",
+                "version": "${{ github.sha }}"
+              }
+            },
+            "components": [
+              {
+                "type": "library",
+                "name": "biogears",
+                "version": "fallback"
+              }
+            ]
+          }
+          EOF
+          }
+          
+          # Also generate JSON format scan results for standard image - for policy evaluation
+          echo "Generating vulnerability scan report for standard image..."
           trivy image --format json --output trivy-scan.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} || {
             echo "Failed to generate scan report, creating minimal report..."
             cat > trivy-scan.json << EOF
@@ -801,14 +837,244 @@ jobs:
           }
           EOF
           }
+          
+          # Generate JSON format scan results for distroless image
+          echo "Generating vulnerability scan report for distroless image..."
+          trivy image --format json --output trivy-distroless-scan.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless || {
+            echo "Failed to generate distroless scan report, creating minimal report..."
+            cat > trivy-distroless-scan.json << EOF
+          {
+            "SchemaVersion": 2,
+            "ArtifactName": "ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless",
+            "ArtifactType": "container_image",
+            "Metadata": {
+              "ImageID": "${IMAGE_DIGEST}",
+              "DiffIDs": null,
+              "RepoTags": [
+                "ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless"
+              ],
+              "RepoDigests": [
+                "ghcr.io/${{ github.repository_owner }}/biogears-hari-distroless@${IMAGE_DIGEST}"
+              ],
+              "ImageConfig": {
+                "architecture": "amd64",
+                "os": "linux"
+              }
+            },
+            "Results": []
+          }
+          EOF
+          }
       
+      - name: Generate Vulnerability Comparison Report
+        shell: bash
+        run: |
+          echo "Generating vulnerability comparison report between standard and distroless images..."
+          sudo apt-get update
+          sudo apt-get install -y jq
+          
+          STANDARD_IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}"
+          DISTROLESS_IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless"
+          
+          # Generate detailed vulnerabilities report with table format for each image
+          trivy image --format table --output standard-vulns.txt $STANDARD_IMAGE || echo "Failed to generate standard image vulnerability table"
+          trivy image --format table --output distroless-vulns.txt $DISTROLESS_IMAGE || echo "Failed to generate distroless image vulnerability table"
+          
+          # Count vulnerabilities by severity for both images
+          standard_critical=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")] | length' trivy-scan.json || echo "0")
+          standard_high=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="HIGH")] | length' trivy-scan.json || echo "0")
+          standard_medium=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="MEDIUM")] | length' trivy-scan.json || echo "0")
+          standard_low=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="LOW")] | length' trivy-scan.json || echo "0")
+          standard_total=$((standard_critical + standard_high + standard_medium + standard_low))
+          
+          distroless_critical=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")] | length' trivy-distroless-scan.json || echo "0")
+          distroless_high=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="HIGH")] | length' trivy-distroless-scan.json || echo "0")
+          distroless_medium=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="MEDIUM")] | length' trivy-distroless-scan.json || echo "0")
+          distroless_low=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="LOW")] | length' trivy-distroless-scan.json || echo "0")
+          distroless_total=$((distroless_critical + distroless_high + distroless_medium + distroless_low))
+          
+          # Calculate reduction percentage
+          if [ "$standard_total" -gt 0 ]; then
+            reduction_percent=$(( (standard_total - distroless_total) * 100 / standard_total ))
+          else
+            reduction_percent=0
+          fi
+          
+          # Extract most critical vulnerabilities with CVE IDs and remediation steps
+          echo "Extracting critical vulnerabilities..."
+          jq -r '.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL" or .Severity=="HIGH") | "\(.VulnerabilityID) | \(.Severity) | \(.PkgName):\(.InstalledVersion) | \(.Title) | \(.Description) | \(.PrimaryURL) | \(if .FixedVersion then "Upgrade to \(.FixedVersion)" else "No fix available" end)"' trivy-scan.json > critical-vulns.txt || echo "No critical vulnerabilities found in standard image"
+          
+          # Create the HTML report
+          cat > vulnerability-comparison-report.html << EOF
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>BioGears Container Vulnerability Comparison Report</title>
+            <style>
+              body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 1200px; margin: 0 auto; padding: 20px; }
+              h1, h2, h3 { color: #2c3e50; }
+              table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+              th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+              th { background-color: #f2f2f2; }
+              .critical { background-color: #ffdddd; }
+              .high { background-color: #ffffcc; }
+              .medium { background-color: #e6f3ff; }
+              .low { background-color: #eafaea; }
+              .summary { display: flex; justify-content: space-around; margin: 20px 0; }
+              .summary-box { border: 1px solid #ddd; padding: 15px; border-radius: 5px; text-align: center; width: 30%; }
+              .cve-table { font-size: 0.9em; }
+              .improvement { color: green; font-weight: bold; }
+              .warning { color: #cc0000; font-weight: bold; }
+              .remediation { background-color: #f9f9f9; padding: 10px; border-left: 3px solid #2c3e50; margin: 10px 0; }
+              pre { background-color: #f6f8fa; padding: 10px; overflow: auto; }
+              .container { display: flex; }
+              .col-50 { flex: 50%; padding: 10px; }
+            </style>
+          </head>
+          <body>
+            <h1>BioGears Container Vulnerability Comparison Report</h1>
+            <p>Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC") | Repository: ${{ github.repository }} | Commit: ${{ github.sha }}</p>
+            
+            <div class="summary">
+              <div class="summary-box">
+                <h3>Standard Image</h3>
+                <p><strong>$standard_total</strong> total vulnerabilities</p>
+                <p class="warning">Critical: $standard_critical</p>
+                <p>High: $standard_high</p>
+                <p>Medium: $standard_medium</p>
+                <p>Low: $standard_low</p>
+              </div>
+              
+              <div class="summary-box">
+                <h3>Distroless Image</h3>
+                <p><strong>$distroless_total</strong> total vulnerabilities</p>
+                <p class="warning">Critical: $distroless_critical</p>
+                <p>High: $distroless_high</p>
+                <p>Medium: $distroless_medium</p>
+                <p>Low: $distroless_low</p>
+              </div>
+              
+              <div class="summary-box">
+                <h3>Security Improvement</h3>
+                <p class="improvement">$reduction_percent% vulnerability reduction</p>
+                <p>Critical reduction: $(( standard_critical - distroless_critical ))</p>
+                <p>High reduction: $(( standard_high - distroless_high ))</p>
+              </div>
+            </div>
+            
+            <h2>Most Critical Vulnerabilities</h2>
+            <p>The following critical and high severity vulnerabilities should be addressed:</p>
+            
+            <table class="cve-table">
+              <tr>
+                <th>CVE ID</th>
+                <th>Severity</th>
+                <th>Package</th>
+                <th>Description</th>
+                <th>Remediation</th>
+              </tr>
+              $(awk -F' \\| ' '{print "<tr class=\"" tolower($2) "\"><td><a href=\"" $6 "\">" $1 "</a></td><td>" $2 "</td><td>" $3 "</td><td>" $4 "</td><td>" $7 "</td></tr>"}' critical-vulns.txt | head -n 10)
+            </table>
+            
+            <h2>Detailed Comparison</h2>
+            <div class="container">
+              <div class="col-50">
+                <h3>Standard Image Vulnerabilities</h3>
+                <pre>$(cat standard-vulns.txt || echo "No vulnerabilities found")</pre>
+              </div>
+              <div class="col-50">
+                <h3>Distroless Image Vulnerabilities</h3>
+                <pre>$(cat distroless-vulns.txt || echo "No vulnerabilities found")</pre>
+              </div>
+            </div>
+            
+            <h2>Remediation Recommendations</h2>
+            <div class="remediation">
+              <h3>Immediate Actions</h3>
+              <ol>
+                <li>Update base images to their latest versions</li>
+                <li>Apply security patches to vulnerable packages</li>
+                <li>Consider using the distroless image for production deployments</li>
+                <li>Implement runtime protection to mitigate exploitation of remaining vulnerabilities</li>
+              </ol>
+            </div>
+            
+            <div class="remediation">
+              <h3>Long-term Strategy</h3>
+              <ol>
+                <li>Implement regular vulnerability scanning in CI/CD pipeline (already done)</li>
+                <li>Establish vulnerability management process for timely remediation</li>
+                <li>Consider multi-stage builds to minimize dependencies in final image</li>
+                <li>Evaluate using scratch container with static builds for critical components</li>
+              </ol>
+            </div>
+            
+            <hr>
+            <p>This report was automatically generated by the BioGears CI/CD pipeline.</p>
+          </body>
+          </html>
+          EOF
+          
+          # Create Markdown version for easier viewing in GitHub
+          cat > vulnerability-comparison-report.md << EOF
+          # BioGears Container Vulnerability Comparison Report
+          
+          Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC") | Repository: ${{ github.repository }} | Commit: ${{ github.sha }}
+          
+          ## Summary
+          
+          | Metric | Standard Image | Distroless Image | Improvement |
+          |--------|---------------|------------------|-------------|
+          | **Total Vulnerabilities** | $standard_total | $distroless_total | $reduction_percent% reduction |
+          | Critical | $standard_critical | $distroless_critical | $(( standard_critical - distroless_critical )) fewer |
+          | High | $standard_high | $distroless_high | $(( standard_high - distroless_high )) fewer |
+          | Medium | $standard_medium | $distroless_medium | $(( standard_medium - distroless_medium )) fewer |
+          | Low | $standard_low | $distroless_low | $(( standard_low - distroless_low )) fewer |
+          
+          ## Most Critical Vulnerabilities
+          
+          The following critical and high severity vulnerabilities should be addressed:
+          
+          | CVE ID | Severity | Package | Description | Remediation |
+          |--------|----------|---------|-------------|-------------|
+          $(awk -F' \\| ' '{print "| [" $1 "](" $6 ") | " $2 " | " $3 " | " $4 " | " $7 " |"}' critical-vulns.txt | head -n 10)
+          
+          ## Remediation Recommendations
+          
+          ### Immediate Actions
+          1. Update base images to their latest versions
+          2. Apply security patches to vulnerable packages
+          3. Consider using the distroless image for production deployments
+          4. Implement runtime protection to mitigate exploitation of remaining vulnerabilities
+          
+          ### Long-term Strategy
+          1. Implement regular vulnerability scanning in CI/CD pipeline (already done)
+          2. Establish vulnerability management process for timely remediation
+          3. Consider multi-stage builds to minimize dependencies in final image
+          4. Evaluate using scratch container with static builds for critical components
+          
+          ---
+          
+          This report was automatically generated by the BioGears CI/CD pipeline.
+          EOF
+          
+          echo "Vulnerability comparison report generated successfully."
+          
       - name: Upload SBOM and scan results
         uses: actions/upload-artifact@v4
         with:
           name: security-artifacts
           path: |
             sbom-with-vulns.cyclonedx.json
+            sbom-distroless-with-vulns.cyclonedx.json
             trivy-scan.json
+            trivy-distroless-scan.json
+            vulnerability-comparison-report.html
+            vulnerability-comparison-report.md
+            standard-vulns.txt
+            distroless-vulns.txt
 
   # Create and sign policies
   create-policies:
@@ -2421,3 +2687,256 @@ jobs:
           - **Zero Key Management**: Eliminates private key management challenges
           - **Auditability**: All signatures are publicly verifiable in Rekor logs
           - **Identity-Based**: Signatures linked to GitHub Actions identity
+          EOF
+      
+      - name: Collect information from all stages
+        run: |
+          mkdir -p progress-report
+          
+          # Collect build information
+          if [ -f "biogears-build/build-metadata.json" ]; then
+            cp biogears-build/build-metadata.json progress-report/
+            BUILD_STATUS="✅ Successful"
+          else
+            echo '{"build_status": "unknown"}' > progress-report/build-metadata.json
+            BUILD_STATUS="⚠️ Unknown"
+          fi
+          
+          # Collect image information
+          if [ -f "image-digest/image-digest.txt" ]; then
+            cp image-digest/image-digest.txt progress-report/
+            IMAGE_STATUS="✅ Published"
+          else
+            echo "IMAGE_DIGEST=unknown" > progress-report/image-digest.txt
+            IMAGE_STATUS="⚠️ Unknown"
+          fi
+          
+          # Collect security scan results
+          if [ -f "security-artifacts/trivy-scan.json" ]; then
+            cp security-artifacts/trivy-scan.json progress-report/
+            cp security-artifacts/trivy-distroless-scan.json progress-report/ 2>/dev/null || echo "Distroless scan not found"
+            cp security-artifacts/vulnerability-comparison-report.md progress-report/ 2>/dev/null || echo "Vulnerability report not found"
+            cp security-artifacts/vulnerability-comparison-report.html progress-report/ 2>/dev/null || echo "Vulnerability HTML report not found"
+            
+            # Get vulnerability counts
+            CRITICAL_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")] | length' security-artifacts/trivy-scan.json 2>/dev/null || echo "N/A")
+            HIGH_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="HIGH")] | length' security-artifacts/trivy-scan.json 2>/dev/null || echo "N/A")
+            MEDIUM_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="MEDIUM")] | length' security-artifacts/trivy-scan.json 2>/dev/null || echo "N/A")
+            
+            # Get distroless vulnerability counts
+            DISTROLESS_CRITICAL_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")] | length' security-artifacts/trivy-distroless-scan.json 2>/dev/null || echo "N/A")
+            DISTROLESS_HIGH_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="HIGH")] | length' security-artifacts/trivy-distroless-scan.json 2>/dev/null || echo "N/A")
+            
+            if [ "$CRITICAL_COUNT" != "N/A" ] && [ "$DISTROLESS_CRITICAL_COUNT" != "N/A" ]; then
+              CRITICAL_REDUCTION=$((CRITICAL_COUNT - DISTROLESS_CRITICAL_COUNT))
+              HIGH_REDUCTION=$((HIGH_COUNT - DISTROLESS_HIGH_COUNT))
+              if [ $CRITICAL_REDUCTION -gt 0 ] || [ $HIGH_REDUCTION -gt 0 ]; then
+                VULN_REDUCTION_INFO=" (${CRITICAL_REDUCTION} critical & ${HIGH_REDUCTION} high vulnerabilities reduced in distroless)"
+              else
+                VULN_REDUCTION_INFO=""
+              fi
+            else
+              VULN_REDUCTION_INFO=""
+            fi
+            
+            SCAN_STATUS="✅ Completed (Critical: ${CRITICAL_COUNT}, High: ${HIGH_COUNT}, Medium: ${MEDIUM_COUNT})${VULN_REDUCTION_INFO}"
+          else
+            echo '{"scan_status": "unknown"}' > progress-report/trivy-scan.json
+            SCAN_STATUS="⚠️ Unknown"
+            VULN_REDUCTION_INFO=""
+          fi
+      
+      # Summarize vulnerability findings for both container images
+      summarize-vulnerability-findings:
+        name: Summarize Vulnerability Findings
+        needs: publish-artifacts
+        runs-on: ubuntu-latest
+        
+        steps:
+          - name: Checkout code
+            uses: actions/checkout@v3
+          
+          - name: Download security artifacts
+            uses: actions/download-artifact@v4
+            with:
+              name: security-artifacts
+          
+          - name: Install required tools
+            run: |
+              sudo apt-get update
+              sudo apt-get install -y jq
+          
+          - name: Generate vulnerability summary
+            run: |
+              echo "Generating vulnerability summary..."
+              
+              if [ -f "vulnerability-comparison-report.md" ]; then
+                echo "Found vulnerability comparison report, creating summary..."
+                
+                # Parse vulnerability counts
+                standard_total=$(grep -A 5 "^| Metric " vulnerability-comparison-report.md | grep "Total" | awk -F'|' '{print $3}' | tr -d ' ' || echo "N/A")
+                distroless_total=$(grep -A 5 "^| Metric " vulnerability-comparison-report.md | grep "Total" | awk -F'|' '{print $4}' | tr -d ' ' || echo "N/A")
+                reduction_percent=$(grep -A 5 "^| Metric " vulnerability-comparison-report.md | grep "Total" | awk -F'|' '{print $5}' | tr -d ' ' || echo "N/A")
+                critical_standard=$(grep -A 5 "^| Metric " vulnerability-comparison-report.md | grep "Critical" | awk -F'|' '{print $3}' | tr -d ' ' || echo "N/A")
+                critical_distroless=$(grep -A 5 "^| Metric " vulnerability-comparison-report.md | grep "Critical" | awk -F'|' '{print $4}' | tr -d ' ' || echo "N/A")
+              else
+                echo "Vulnerability comparison report not found, using Trivy scan data directly..."
+                
+                # Try to extract vulnerability counts directly from scan files
+                if [ -f "trivy-scan.json" ] && [ -f "trivy-distroless-scan.json" ]; then
+                  standard_critical=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")] | length' trivy-scan.json 2>/dev/null || echo "0")
+                  standard_high=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="HIGH")] | length' trivy-scan.json 2>/dev/null || echo "0")
+                  standard_medium=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="MEDIUM")] | length' trivy-scan.json 2>/dev/null || echo "0")
+                  standard_low=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="LOW")] | length' trivy-scan.json 2>/dev/null || echo "0")
+                  standard_total=$((standard_critical + standard_high + standard_medium + standard_low))
+                  
+                  distroless_critical=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")] | length' trivy-distroless-scan.json 2>/dev/null || echo "0")
+                  distroless_high=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="HIGH")] | length' trivy-distroless-scan.json 2>/dev/null || echo "0")
+                  distroless_medium=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="MEDIUM")] | length' trivy-distroless-scan.json 2>/dev/null || echo "0")
+                  distroless_low=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="LOW")] | length' trivy-distroless-scan.json 2>/dev/null || echo "0")
+                  distroless_total=$((distroless_critical + distroless_high + distroless_medium + distroless_low))
+                  
+                  if [ "$standard_total" -gt 0 ]; then
+                    reduction_percent=$(( (standard_total - distroless_total) * 100 / standard_total ))
+                  else
+                    reduction_percent=0
+                  fi
+                  
+                  critical_standard=$standard_critical
+                  critical_distroless=$distroless_critical
+                else
+                  standard_total="N/A"
+                  distroless_total="N/A"
+                  reduction_percent="N/A"
+                  critical_standard="N/A"
+                  critical_distroless="N/A"
+                fi
+              fi
+              
+              # Generate summary to be used in GitHub step summary
+              cat > vulnerability-summary.md << EOF
+              # Container Security Vulnerability Summary
+              
+              ## Standard vs Distroless Image Comparison
+              
+              | Image Type | Total Vulnerabilities | Critical Vulnerabilities |
+              |------------|----------------------|--------------------------|
+              | Standard | $standard_total | $critical_standard |
+              | Distroless | $distroless_total | $critical_distroless |
+              | **Improvement** | **${reduction_percent}** | **$(( critical_standard - critical_distroless ))** |
+              
+              ## Most Critical Vulnerabilities
+              
+              $(if [ -f "critical-vulns.txt" ]; then
+                  echo "The following critical and high severity vulnerabilities should be addressed:"
+                  echo ""
+                  echo "| CVE ID | Severity | Package | Remediation |"
+                  echo "|--------|----------|---------|-------------|"
+                  awk -F' \\| ' '{print "| " $1 " | " $2 " | " $3 " | " $7 " |"}' critical-vulns.txt | head -n 5
+                else
+                  echo "Detailed vulnerability information is available in the full report."
+                fi)
+              
+              ## Remediation Recommendations
+              
+              1. **Update base images** to their latest versions 
+              2. **Use the distroless image** for production deployments
+              3. **Review and update** vulnerable dependencies
+              4. **Implement runtime protection** for remaining vulnerabilities
+              
+              For complete details, see the vulnerability comparison report in the workflow artifacts.
+              EOF
+              
+              cat vulnerability-summary.md
+          
+          - name: Upload vulnerability summary
+            uses: actions/upload-artifact@v4
+            with:
+              name: vulnerability-summary
+              path: vulnerability-summary.md
+          
+          - name: Add vulnerability summary to GitHub step summary
+            run: cat vulnerability-summary.md >> $GITHUB_STEP_SUMMARY
+
+  # Create demonstration materials for supply chain security
+  create-demo-materials:
+    name: Create Security Demo Materials
+    needs: [publish-artifacts, summarize-vulnerability-findings]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    
+    steps:
+      - name: Download demo materials
+        uses: actions/download-artifact@v4
+        with:
+          name: security-demo-materials
+          path: demo-run
+      
+      - name: Download vulnerability summary
+        uses: actions/download-artifact@v4
+        with:
+          name: vulnerability-summary
+          path: demo-run/vulnerability
+      
+      - name: Create vulnerability comparison demo
+        shell: bash
+        run: |
+          mkdir -p demo-run/demo-materials/vulnerability-demo
+          
+          # Create vulnerability comparison demo script
+          cat > demo-run/demo-materials/vulnerability-demo/compare-containers.sh << 'EOF'
+          #!/bin/bash
+          # Demo: Container Vulnerability Comparison
+          
+          echo "=== DEMO: Container Security Analysis ==="
+          
+          echo "Step 1: Scan standard container image"
+          trivy image --severity HIGH,CRITICAL --no-progress "${STANDARD_IMAGE:-ghcr.io/your-org/biogears:latest}"
+          
+          echo "Step 2: Scan distroless container image"
+          trivy image --severity HIGH,CRITICAL --no-progress "${DISTROLESS_IMAGE:-ghcr.io/your-org/biogears:distroless}"
+          
+          echo "Step 3: Generate vulnerability comparison report"
+          echo "Comparing vulnerability profiles..."
+          cat vulnerability-summary.md
+          
+          echo "Step 4: Verify container image integrity"
+          cosign verify --key cosign.pub "${DISTROLESS_IMAGE:-ghcr.io/your-org/biogears:distroless}" || \
+          echo "To verify with keyless signing: cosign verify --certificate-identity $GITHUB_REPO_OWNER --certificate-oidc-issuer https://token.actions.githubusercontent.com ${DISTROLESS_IMAGE:-ghcr.io/your-org/biogears:distroless}"
+          EOF
+          
+          chmod +x demo-run/demo-materials/vulnerability-demo/compare-containers.sh
+          
+          # Create demo documentation
+          cat > demo-run/demo-materials/vulnerability-demo/readme.md << EOF
+          # Container Vulnerability Comparison Demo
+          
+          This demo demonstrates how to compare the security posture of standard and distroless container images.
+          
+          ## Security Value
+          
+          - **Reduced Attack Surface**: Shows how distroless containers minimize vulnerabilities
+          - **CVE Detection**: Identifies specific vulnerabilities by CVE ID and severity
+          - **Remediation Guidance**: Provides actionable steps to address vulnerabilities
+          - **Quantifiable Improvement**: Measures security improvement with metrics
+          
+          ## How to Run
+          
+          ```bash
+          # Set the images to compare
+          export STANDARD_IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:latest"
+          export DISTROLESS_IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:distroless"
+          
+          # Run the comparison demo
+          ./compare-containers.sh
+          ```
+          
+          ## Vulnerability Summary
+          
+          $(cat demo-run/vulnerability/vulnerability-summary.md)
+          EOF
+          
+          # Copy vulnerability summary to demo materials
+          cp demo-run/vulnerability/vulnerability-summary.md demo-run/demo-materials/vulnerability-demo/
+          
+          echo "Vulnerability comparison demo created successfully."
