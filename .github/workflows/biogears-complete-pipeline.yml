@@ -131,7 +131,7 @@ jobs:
             mkdir -p docker/modified
             sed "s|^FROM biogears-external.*|FROM ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest|g" \
               docker/modified/Dockerfile.release > docker/modified/Dockerfile.builder
-              
+            
             echo "Modified Dockerfile contents:"
             cat docker/modified/Dockerfile.builder
             
@@ -435,7 +435,7 @@ jobs:
             echo '  "build_platform": "linux"' >> build-output/build-metadata.json
             echo '}' >> build-output/build-metadata.json
           fi
-          
+
           # Copy build artifacts to the Docker build context directories
           # Using -r (recursive) with cp to ensure all directory contents are copied
           # Using || to allow the build to continue even if some files are missing
@@ -624,7 +624,7 @@ jobs:
           
           echo "IMAGE_DIGEST=$DIGEST" > image-digest.txt
           echo "image_digest=$DIGEST" >> $GITHUB_OUTPUT
-          
+      
           # Reset errors
           set +x  # Disable command echo
       
@@ -700,7 +700,7 @@ jobs:
   #######################################
   # STAGE 2: SECURITY METADATA
   #######################################
-  
+
   # Generate SBOM and scan for vulnerabilities
   security-scan:
     name: Generate SBOM and Scan
@@ -1061,7 +1061,7 @@ jobs:
           EOF
           
           echo "Vulnerability comparison report generated successfully."
-          
+      
       - name: Upload SBOM and scan results
         uses: actions/upload-artifact@v4
         with:
@@ -1766,7 +1766,7 @@ jobs:
           tar -czvf all-signatures.tar.gz all-signatures/ || {
             echo "Failed to create all-signatures.tar.gz, creating minimal archive"
             echo "dummy-signature" > all-signatures/dummy.sig
-            tar -czvf all-signatures.tar.gz all-signatures/
+          tar -czvf all-signatures.tar.gz all-signatures/
           }
           
           # Reset errors
@@ -1801,7 +1801,10 @@ jobs:
           sudo apt-get install -y jq curl wget python3-pip clamav clamdscan
           
           # Install security testing tools
-          pip3 install bandit safety docker-bench-security
+          pip3 install bandit safety
+          
+          # Clone docker-bench-security instead of pip installing it
+          git clone https://github.com/docker/docker-bench-security.git
           
           # Install Trivy
           wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
@@ -1821,22 +1824,10 @@ jobs:
           echo "=== TESTING: CIS Docker Benchmark ==="
           echo "Running Docker Bench Security..."
           
-          # Create a temporary script to run docker-bench-security
-          cat > run-docker-bench.sh << 'EOF'
-          #!/bin/bash
-          docker run --rm --net host --pid host --userns host --cap-add audit_control \
-            -e DOCKER_CONTENT_TRUST=$DOCKER_CONTENT_TRUST \
-            -v /etc:/etc:ro \
-            -v /usr/bin/containerd:/usr/bin/containerd:ro \
-            -v /usr/bin/runc:/usr/bin/runc:ro \
-            -v /usr/lib/systemd:/usr/lib/systemd:ro \
-            -v /var/lib:/var/lib:ro \
-            -v /var/run/docker.sock:/var/run/docker.sock:ro \
-            docker/docker-bench-security > docker-bench-results.txt || echo "Docker bench failed but continuing"
-          EOF
-          
-          chmod +x run-docker-bench.sh
-          ./run-docker-bench.sh || echo "Docker bench could not run, continuing with tests"
+          # Use the cloned docker-bench-security repository
+          cd docker-bench-security
+          sudo sh docker-bench-security.sh -c container_images > ../docker-bench-results.txt || echo "Docker bench failed but continuing"
+          cd ..
           
           # Generate report (whether the benchmark ran or not)
           cat > security-tests/reports/docker-benchmark-report.md << EOF
@@ -2315,7 +2306,7 @@ jobs:
           # Copy SBOM with error handling
           if [ -d "security-artifacts" ] && [ -f "security-artifacts/sbom-with-vulns.cyclonedx.json" ]; then
             echo "Copying SBOM from security-artifacts"
-            cp security-artifacts/sbom-with-vulns.cyclonedx.json artifacts/sboms/
+          cp security-artifacts/sbom-with-vulns.cyclonedx.json artifacts/sboms/
           else
             echo "Creating minimal SBOM for publishing"
             cat > artifacts/sboms/sbom-with-vulns.cyclonedx.json << EOF
@@ -2370,7 +2361,7 @@ jobs:
           # Extract and copy signatures with error handling
           if [ -d "attestation-artifacts" ] && [ -f "attestation-artifacts/all-signatures.tar.gz" ]; then
             echo "Extracting signatures from attestation-artifacts"
-            mkdir -p temp-sigs
+          mkdir -p temp-sigs
             tar -xzf attestation-artifacts/all-signatures.tar.gz -C temp-sigs || {
               echo "Failed to extract signatures, creating minimal signature"
               mkdir -p temp-sigs/all-signatures
@@ -2385,7 +2376,7 @@ jobs:
           # Extract and copy policies with error handling
           if [ -d "policy-artifacts" ] && [ -f "policy-artifacts/signed-policies.tar.gz" ]; then
             echo "Extracting policies from policy-artifacts"
-            mkdir -p temp-policies
+          mkdir -p temp-policies
             tar -xzf policy-artifacts/signed-policies.tar.gz -C temp-policies || {
               echo "Failed to extract policies, creating minimal policy"
               mkdir -p temp-policies/policies/rego
@@ -2850,8 +2841,8 @@ jobs:
               cat vulnerability-summary.md
           
           - name: Upload vulnerability summary
-            uses: actions/upload-artifact@v4
-            with:
+        uses: actions/upload-artifact@v4
+        with:
               name: vulnerability-summary
               path: vulnerability-summary.md
           
