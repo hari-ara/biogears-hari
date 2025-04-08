@@ -420,8 +420,8 @@ jobs:
           ls -la build-output || echo "build-output directory not found"
           
           # Create a directory for Docker builds - ensure these exist with proper permissions
-          mkdir -p docker-context/lib docker-context/bin
-          chmod -R 755 docker-context
+          mkdir -p docker-context/lib docker-context/bin docker-context-distroless/lib docker-context-distroless/bin
+          chmod -R 755 docker-context docker-context-distroless
           
           # Verify build-metadata.json exists
           if [ ! -f "build-output/build-metadata.json" ]; then
@@ -429,55 +429,34 @@ jobs:
             echo '{' > build-output/build-metadata.json
             echo '  "builder_id": "github-actions-docker",' >> build-output/build-metadata.json
             echo '  "build_type": "Release",' >> build-output/build-metadata.json
-            echo '  "source_repo": "${{ github.server_url }}/${{ github.repository }}",' >> build-output/build-metadata.json
+            echo '  "source_repo": "github.com/${{ github.repository }}",' >> build-output/build-metadata.json
             echo '  "commit_hash": "${{ github.sha }}",' >> build-output/build-metadata.json
             echo '  "build_timestamp": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",' >> build-output/build-metadata.json
             echo '  "build_platform": "linux"' >> build-output/build-metadata.json
             echo '}' >> build-output/build-metadata.json
           fi
-
-          echo "Contents of build-metadata.json:"
-          cat build-output/build-metadata.json || echo "Failed to read build-metadata.json"
-
-          # Copy files with error handling
-          echo "Copying lib directory..."
-          if [ -d "build-output/lib" ]; then
-            echo "build-output/lib directory exists, contents:"
-            ls -la build-output/lib || echo "Failed to list build-output/lib"
-            
-            if [ "$(ls -A build-output/lib 2>/dev/null)" ]; then
-              echo "build-output/lib is not empty, copying contents..."
-              cp -rv build-output/lib/* docker-context/lib/ || { echo "Warning: Failed to copy lib directory contents"; }
-            else
-              echo "build-output/lib is empty"
-            fi
-          else
-            echo "build-output/lib directory does not exist"
-          fi
           
-          # Always create a minimal library file if needed
+          # Copy build artifacts to the Docker build context directories
+          # Using -r (recursive) with cp to ensure all directory contents are copied
+          # Using || to allow the build to continue even if some files are missing
+          cp -rv build-output/lib/* docker-context/lib/ || echo "Warning: No libraries to copy"
+          cp -rv build-output/bin/* docker-context/bin/ || echo "Warning: No binaries to copy"
+          cp -v build-output/build-metadata.json docker-context/ || echo "Warning: No build metadata to copy"
+          
+          # Copy the same files to the distroless context
+          cp -rv build-output/lib/* docker-context-distroless/lib/ || echo "Warning: No libraries to copy"
+          cp -rv build-output/bin/* docker-context-distroless/bin/ || echo "Warning: No binaries to copy"
+          cp -v build-output/build-metadata.json docker-context-distroless/ || echo "Warning: No build metadata to copy"
+          
+          # Create a minimal library file if needed
           if [ ! "$(ls -A docker-context/lib 2>/dev/null)" ]; then
             echo "Creating minimal library file"
             echo "Minimal BioGears Library for Testing" > docker-context/lib/libbiogears.so
-            chmod 644 docker-context/lib/libbiogears.so
+            echo "Minimal BioGears Library for Testing" > docker-context-distroless/lib/libbiogears.so
+            chmod 644 docker-context/lib/libbiogears.so docker-context-distroless/lib/libbiogears.so
           fi
           
-          echo "Copying bin directory..."
-          if [ -d "build-output/bin" ]; then
-            echo "build-output/bin directory exists, contents:"
-            ls -la build-output/bin || echo "Failed to list build-output/bin"
-            
-            if [ "$(ls -A build-output/bin 2>/dev/null)" ]; then
-              echo "build-output/bin is not empty, copying contents..."
-              cp -rv build-output/bin/* docker-context/bin/ || { echo "Warning: Failed to copy bin directory contents"; }
-            else
-              echo "build-output/bin is empty"
-            fi
-          else
-            echo "build-output/bin directory does not exist"
-          fi
-          
-          # Always create a minimal executable if needed
+          # Create a minimal executable if needed
           if [ ! "$(ls -A docker-context/bin 2>/dev/null)" ]; then
             echo "Creating minimal executable"
             echo '#!/bin/bash' > docker-context/bin/bg-cli
@@ -553,6 +532,20 @@ jobs:
           outputs: type=registry
           github-token: ${{ secrets.GITHUB_TOKEN }}
           
+      - name: Build and push BioGears Distroless Docker image
+        id: docker_build_distroless
+        uses: docker/build-push-action@v4
+        continue-on-error: true
+        with:
+          context: docker-context-distroless
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless,ghcr.io/${{ github.repository_owner }}/biogears-hari:distroless
+          platforms: linux/amd64
+          load: false
+          provenance: false
+          outputs: type=registry
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          
       - name: Try alternate Docker build if first attempt failed
         if: steps.docker_build.outcome == 'failure'
         shell: bash
@@ -564,12 +557,27 @@ jobs:
           # Push the image
           echo "Pushing image to registry..."
           docker push ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
+          
+      - name: Try alternate Docker build for distroless if first attempt failed
+        if: steps.docker_build_distroless.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "First distroless Docker build attempt failed, trying direct docker build..."
+          cd docker-context-distroless
+          docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless .
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless ghcr.io/${{ github.repository_owner }}/biogears-hari:distroless
+          
+          # Push the images
+          echo "Pushing distroless images to registry..."
+          docker push ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless
+          docker push ghcr.io/${{ github.repository_owner }}/biogears-hari:distroless
       
       - name: Push to JFrog Artifactory
         if: env.ARTIFACTORY_DOCKER_REGISTRY != '/docker'
         shell: bash
         run: |
           echo "Pushing image to JFrog Artifactory..."
+          # Push standard image
           JFROG_IMAGE="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${{ github.sha }}"
           docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} $JFROG_IMAGE
           docker push $JFROG_IMAGE
@@ -579,7 +587,18 @@ jobs:
           docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} $JFROG_LATEST
           docker push $JFROG_LATEST
           
+          # Push distroless image
+          JFROG_DISTROLESS="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${{ github.sha }}-distroless"
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless $JFROG_DISTROLESS
+          docker push $JFROG_DISTROLESS
+          
+          # Tag distroless as latest-distroless
+          JFROG_DISTROLESS_LATEST="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:latest-distroless"
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless $JFROG_DISTROLESS_LATEST
+          docker push $JFROG_DISTROLESS_LATEST
+          
           echo "JFROG_IMAGE=$JFROG_IMAGE" >> image-digest.txt
+          echo "JFROG_DISTROLESS=$JFROG_DISTROLESS" >> image-digest.txt
       
       - name: Get image digest
         id: image_digest
@@ -619,27 +638,55 @@ jobs:
           sudo mv cosign-linux-amd64 /usr/local/bin/cosign-keyless
           
           echo "Keyless signing with Sigstore (OIDC identity)..."
-          IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}"
+          # Sign standard image
+          STANDARD_IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}"
+          echo "Signing standard image: $STANDARD_IMAGE"
+          cosign-keyless sign --yes $STANDARD_IMAGE
           
-          # Keyless signing using GitHub OIDC identity
-          echo "Signing with GitHub OIDC identity and Rekor transparency log..."
-          cosign-keyless sign --yes $IMAGE
+          # Sign distroless image
+          DISTROLESS_IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless"
+          echo "Signing distroless image: $DISTROLESS_IMAGE"
+          cosign-keyless sign --yes $DISTROLESS_IMAGE
+          
+          # Also sign the "distroless" tag
+          DISTROLESS_LATEST="ghcr.io/${{ github.repository_owner }}/biogears-hari:distroless"
+          echo "Signing distroless latest tag: $DISTROLESS_LATEST"
+          cosign-keyless sign --yes $DISTROLESS_LATEST
           
           # Add keyless signature info to image-digest.txt
           echo "KEYLESS_SIGNED=true" >> image-digest.txt
+          echo "DISTROLESS_KEYLESS_SIGNED=true" >> image-digest.txt
           echo "SIGSTORE_IDENTITY=https://github.com/${{ github.repository_owner }}" >> image-digest.txt
           
-          # Also sign JFrog image if configured
+          # Also sign JFrog images if configured
           if [ -n "${{ secrets.JFROG_URL }}" ] && [ -n "${{ secrets.JFROG_USER }}" ]; then
+            # Sign standard JFrog image
             JFROG_IMAGE="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${{ github.sha }}"
+            echo "Signing JFrog standard image: $JFROG_IMAGE"
             cosign-keyless sign --yes $JFROG_IMAGE
+            
+            # Sign distroless JFrog image
+            JFROG_DISTROLESS="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${{ github.sha }}-distroless"
+            echo "Signing JFrog distroless image: $JFROG_DISTROLESS"
+            cosign-keyless sign --yes $JFROG_DISTROLESS
+            
+            # Sign latest distroless JFrog image
+            JFROG_DISTROLESS_LATEST="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:latest-distroless"
+            echo "Signing JFrog distroless latest: $JFROG_DISTROLESS_LATEST"
+            cosign-keyless sign --yes $JFROG_DISTROLESS_LATEST
+            
             echo "JFROG_KEYLESS_SIGNED=true" >> image-digest.txt
+            echo "JFROG_DISTROLESS_KEYLESS_SIGNED=true" >> image-digest.txt
           fi
           
           # Get the Rekor entry - this proves the signature exists in public transparency log
-          echo "Getting Rekor entry for transparency log verification..."
-          cosign-keyless triangulate $IMAGE > rekor-entry.txt
-          echo "Rekor transparency log entry created at: $(cat rekor-entry.txt)"
+          echo "Getting Rekor entry for standard image transparency log verification..."
+          cosign-keyless triangulate $STANDARD_IMAGE > rekor-entry-standard.txt
+          echo "Rekor transparency log entry created for standard image at: $(cat rekor-entry-standard.txt)"
+          
+          echo "Getting Rekor entry for distroless image transparency log verification..."
+          cosign-keyless triangulate $DISTROLESS_IMAGE > rekor-entry-distroless.txt
+          echo "Rekor transparency log entry created for distroless image at: $(cat rekor-entry-distroless.txt)"
       
       - name: Upload image digest and Rekor info
         uses: actions/upload-artifact@v4
@@ -647,7 +694,8 @@ jobs:
           name: image-digest
           path: |
             image-digest.txt
-            rekor-entry.txt
+            rekor-entry-standard.txt
+            rekor-entry-distroless.txt
 
   #######################################
   # STAGE 2: SECURITY METADATA
@@ -1888,7 +1936,13 @@ jobs:
             "predicateType": "https://slsa.dev/provenance/v0.2",
             "subject": [
               {
-                "name": "ghcr.io/${{ github.repository_owner }}/biogears-hari",
+                "name": "ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}",
+                "digest": {
+                  "sha256": "${{ github.sha }}"
+                }
+              },
+              {
+                "name": "ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless",
                 "digest": {
                   "sha256": "${{ github.sha }}"
                 }
@@ -1944,23 +1998,39 @@ jobs:
           chmod +x cosign-linux-amd64
           sudo mv cosign-linux-amd64 /usr/local/bin/cosign-keyless
           
-          # Sign the provenance with keyless signing
-          IMAGE_REF="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}"
-          cosign-keyless attest --yes --type slsaprovenance --predicate provenance.json $IMAGE_REF
+          # Sign the provenance with keyless signing for standard image
+          STANDARD_IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}"
+          echo "Attaching SLSA provenance to standard image: $STANDARD_IMAGE"
+          cosign-keyless attest --yes --type slsaprovenance --predicate provenance.json $STANDARD_IMAGE
+          
+          # Sign the provenance with keyless signing for distroless image
+          DISTROLESS_IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless"
+          echo "Attaching SLSA provenance to distroless image: $DISTROLESS_IMAGE"
+          cosign-keyless attest --yes --type slsaprovenance --predicate provenance.json $DISTROLESS_IMAGE
           
           echo "SLSA_PROVENANCE=true" >> attestation-metadata.txt
+          echo "DISTROLESS_SLSA_PROVENANCE=true" >> attestation-metadata.txt
           echo "SLSA_LEVEL=2" >> attestation-metadata.txt
           
           # If JFrog is configured, also attach provenance there
           if [ -n "${{ secrets.JFROG_URL }}" ] && [ -n "${{ secrets.JFROG_USER }}" ]; then
+            # Attach provenance to standard JFrog image
             JFROG_IMAGE="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${{ github.sha }}"
+            echo "Attaching SLSA provenance to JFrog standard image: $JFROG_IMAGE"
             cosign-keyless attest --yes --type slsaprovenance --predicate provenance.json $JFROG_IMAGE
+            
+            # Attach provenance to distroless JFrog image
+            JFROG_DISTROLESS="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${{ github.sha }}-distroless"
+            echo "Attaching SLSA provenance to JFrog distroless image: $JFROG_DISTROLESS"
+            cosign-keyless attest --yes --type slsaprovenance --predicate provenance.json $JFROG_DISTROLESS
+            
             echo "JFROG_SLSA_PROVENANCE=true" >> attestation-metadata.txt
+            echo "JFROG_DISTROLESS_SLSA_PROVENANCE=true" >> attestation-metadata.txt
           fi
           
           mkdir -p slsa
           cp provenance.json slsa/
-          echo "Generated SLSA provenance and attached to container images"
+          echo "Generated SLSA provenance and attached to all container images"
       
       - name: Upload SLSA provenance
         uses: actions/upload-artifact@v4
@@ -2231,7 +2301,7 @@ jobs:
           DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
           
           # Create registry-specific sections
-          GITHUB_SECTION="### GitHub Container Registry\n- ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}\n\n### GitHub Artifacts\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:sbom-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:attestations-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:signatures-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:policies-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:bundle-${DATE_VERSION}"
+          GITHUB_SECTION="### GitHub Container Registry\n- ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} (standard)\n- ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}-distroless (distroless)\n- ghcr.io/${{ github.repository_owner }}/biogears-hari:distroless (latest distroless)\n\n### GitHub Artifacts\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:sbom-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:attestations-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:signatures-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:policies-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:bundle-${DATE_VERSION}"
           
           # Add JFrog section if configured
           if [ -n "${{ secrets.JFROG_URL }}" ] && [ -n "${{ secrets.JFROG_USER }}" ]; then
