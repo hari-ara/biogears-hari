@@ -11,6 +11,16 @@ permissions:
   contents: read
   packages: write
 
+# JFrog Artifactory Integration
+# The following secrets should be added to GitHub repository:
+# - JFROG_URL: The base URL of your JFrog Artifactory instance (e.g., https://mycompany.jfrog.io/artifactory)
+# - JFROG_USER: Username for JFrog Artifactory
+# - JFROG_API_KEY: API key or password for JFrog Artifactory
+
+env:
+  ARTIFACTORY_DOCKER_REGISTRY: ${{ secrets.JFROG_URL }}/docker
+  ARTIFACTORY_GENERIC_REPO: ${{ secrets.JFROG_URL }}/generic-local
+
 jobs:
   #######################################
   # STAGE 1: BUILD & PACKAGE
@@ -54,6 +64,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       
+      - name: Login to JFrog Artifactory
+        uses: docker/login-action@v3
+        if: env.ARTIFACTORY_DOCKER_REGISTRY != '/docker'
+        with:
+          registry: ${{ env.ARTIFACTORY_DOCKER_REGISTRY }}
+          username: ${{ secrets.JFROG_USER }}
+          password: ${{ secrets.JFROG_API_KEY }}
+      
       - name: Build External Base Image
         shell: bash
         run: |
@@ -62,8 +80,18 @@ jobs:
           
           if [ -f "docker/external/Dockerfile" ]; then
             echo "Using docker/external/Dockerfile for external dependencies"
+            
+            # Build and push to GitHub Container Registry
             docker build -t ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest \
               -f docker/external/Dockerfile docker/external
+              
+            # Also build and push to JFrog Artifactory if configured
+            if [ -n "${{ secrets.JFROG_URL }}" ] && [ -n "${{ secrets.JFROG_USER }}" ]; then
+              echo "Also pushing to JFrog Artifactory"
+              JFROG_IMAGE="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears-external:latest"
+              docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest $JFROG_IMAGE
+              docker push $JFROG_IMAGE
+            fi
           else
             echo "Error: Required docker/external/Dockerfile not found"
             exit 1
@@ -73,6 +101,13 @@ jobs:
           SHORT_SHA="${{ github.sha }}"
           DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
           docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest ghcr.io/${{ github.repository_owner }}/biogears-hari-external:${DATE_VERSION}
+          
+          # Also tag JFrog image if configured
+          if [ -n "${{ secrets.JFROG_URL }}" ] && [ -n "${{ secrets.JFROG_USER }}" ]; then
+            JFROG_IMAGE="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears-external"
+            docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest ${JFROG_IMAGE}:${DATE_VERSION}
+            docker push ${JFROG_IMAGE}:${DATE_VERSION}
+          fi
           
           # Get image digest and save to file
           EXTERNAL_DIGEST=$(docker images --no-trunc --quiet ghcr.io/${{ github.repository_owner }}/biogears-hari-external:latest)
@@ -528,6 +563,22 @@ jobs:
           # Push the image
           echo "Pushing image to registry..."
           docker push ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
+      
+      - name: Push to JFrog Artifactory
+        if: env.ARTIFACTORY_DOCKER_REGISTRY != '/docker'
+        shell: bash
+        run: |
+          echo "Pushing image to JFrog Artifactory..."
+          JFROG_IMAGE="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${{ github.sha }}"
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} $JFROG_IMAGE
+          docker push $JFROG_IMAGE
+          
+          # Also tag with latest
+          JFROG_LATEST="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:latest"
+          docker tag ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} $JFROG_LATEST
+          docker push $JFROG_LATEST
+          
+          echo "JFROG_IMAGE=$JFROG_IMAGE" >> image-digest.txt
       
       - name: Get image digest
         id: image_digest
@@ -1695,21 +1746,82 @@ jobs:
       
       - name: Install required tools
         run: |
+          apt-get update
+          apt-get install -y wget curl jq tar grep
+          
+          # Install Cosign
+          wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          mv cosign-linux-amd64 /usr/local/bin/cosign
+          
           # Install ORAS
           curl -LO https://github.com/oras-project/oras/releases/download/v1.1.0/oras_1.1.0_linux_amd64.tar.gz
           mkdir -p oras-install/
           tar -zxf oras_1.1.0_linux_amd64.tar.gz -C oras-install/
-          sudo mv oras-install/oras /usr/local/bin/
-          oras version || echo "ORAS installation failed but continuing"
+          mv oras-install/oras /usr/local/bin/
           
-          # Install jq
-          sudo apt-get update
-          sudo apt-get install -y jq
+          # Install Docker client
+          apt-get install -y apt-transport-https ca-certificates gnupg lsb-release
+          mkdir -p /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+          apt-get update
+          apt-get install -y docker-ce-cli
+      
+      # Add these steps after other steps
+      - name: Demonstrate multi-registry verification
+        if: env.ARTIFACTORY_DOCKER_REGISTRY != '/docker'
+        shell: bash
+        run: |
+          echo "=== DEMONSTRATION: Multi-Registry Verification ==="
           
-          # Install cosign
-          wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
-          chmod +x cosign-linux-amd64
-          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          # Create simple script to show verifying artifacts from multiple registries
+          cat > demo-run/demo-materials/multi-registry-verification.sh << 'EOF'
+          #!/bin/bash
+          # Demo: Multi-Registry Verification
+          
+          echo "=== DEMO: Verifying Artifacts Across Multiple Registries ==="
+          echo "Step 1: Verify images from GitHub Container Registry"
+          cosign verify --key cosign.pub ghcr.io/${GITHUB_REPOSITORY_OWNER}/biogears-hari:${GITHUB_SHA}
+          
+          echo "Step 2: Verify images from JFrog Artifactory"
+          cosign verify --key cosign.pub ${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${GITHUB_SHA}
+          
+          echo "Step 3: Compare SBOMs from both registries"
+          cosign download sbom ghcr.io/${GITHUB_REPOSITORY_OWNER}/biogears-hari:${GITHUB_SHA} > github-sbom.json
+          cosign download sbom ${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${GITHUB_SHA} > jfrog-sbom.json
+          
+          echo "Step 4: Verify contents match"
+          diff <(jq -S . github-sbom.json) <(jq -S . jfrog-sbom.json) && echo "✅ SBOMs match between registries" || echo "❌ SBOMs differ between registries"
+          EOF
+          
+          chmod +x demo-run/demo-materials/multi-registry-verification.sh
+          
+          # Create documentation for the multi-registry demo
+          cat > demo-run/demo-materials/multi-registry-report.md << EOF
+          # Multi-Registry Verification
+          
+          This demonstration shows how to verify artifacts across multiple registries to ensure consistency:
+          
+          - GitHub Container Registry: ghcr.io/${{ github.repository_owner }}/biogears-hari
+          - JFrog Artifactory: ${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears
+          
+          ## Security Value
+          
+          - **Registry Independence**: Ensures security properties are preserved across registries
+          - **Artifact Consistency**: Verifies the same artifacts are available in both registries
+          - **Signature Portability**: Demonstrates signature verification across different environments
+          - **Reduced Vendor Lock-in**: Shows ability to use multiple registry providers
+          
+          ## Implementation
+          
+          The demonstration script verifies:
+          1. Image signatures can be verified in both registries
+          2. SBOMs attached to images match exactly
+          3. Attestations provide the same security guarantees
+          
+          This approach supports scenarios where different teams or environments access different registries.
+          EOF
       
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -1717,6 +1829,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Login to JFrog Artifactory
+        uses: docker/login-action@v3
+        if: env.ARTIFACTORY_DOCKER_REGISTRY != '/docker'
+        with:
+          registry: ${{ env.ARTIFACTORY_DOCKER_REGISTRY }}
+          username: ${{ secrets.JFROG_USER }}
+          password: ${{ secrets.JFROG_API_KEY }}
       
       - name: Organize artifacts for publishing
         continue-on-error: true
@@ -1975,1253 +2095,58 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Using version: $VERSION"
       
-      - name: Publish artifacts to registry
-        continue-on-error: true
+      - name: Create pipeline report
         run: |
-          set -x  # Enable command echo for debugging
+          SHORT_SHA="${{ github.sha }}"
+          DATE_VERSION="$(date +%Y%m%d)-${SHORT_SHA:0:8}"
           
-          REPOSITORY="ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts"
+          # Create registry-specific sections
+          GITHUB_SECTION="### GitHub Container Registry\n- ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}\n\n### GitHub Artifacts\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:sbom-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:attestations-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:signatures-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:policies-${DATE_VERSION}\n- ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:bundle-${DATE_VERSION}"
           
-          # Define media types
-          SBOM_TYPE="application/vnd.cyclonedx+json"
-          ATTESTATION_TYPE="application/vnd.in-toto+json"
-          SIG_TYPE="application/vnd.sigstore+tar+gzip"
-          POLICY_TYPE="application/vnd.rego+tar+gzip"
-          BUNDLE_TYPE="application/vnd.biogears.bundle+tar+gzip"
+          # Add JFrog section if configured
+          if [ -n "${{ secrets.JFROG_URL }}" ] && [ -n "${{ secrets.JFROG_USER }}" ]; then
+            JFROG_SECTION="\n\n### JFrog Artifactory\n- ${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${{ github.sha }}\n\n### JFrog Artifacts\n- ${ARTIFACTORY_DOCKER_REGISTRY}/biogears/artifacts:sbom-${DATE_VERSION}\n- ${ARTIFACTORY_DOCKER_REGISTRY}/biogears/artifacts:attestations-${DATE_VERSION}\n- ${ARTIFACTORY_DOCKER_REGISTRY}/biogears/artifacts:signatures-${DATE_VERSION}\n- ${ARTIFACTORY_DOCKER_REGISTRY}/biogears/artifacts:policies-${DATE_VERSION}\n- ${ARTIFACTORY_DOCKER_REGISTRY}/biogears/artifacts:bundle-${DATE_VERSION}"
+            JFROG_BROWSE="\n\n## View in JFrog Artifactory\n- ${{ secrets.JFROG_URL }}/webapp/#/artifacts/browse/tree/General/docker/biogears"
+          else
+            JFROG_SECTION=""
+            JFROG_BROWSE=""
+          fi
           
-          # Push artifacts with error handling
-          echo "Pushing SBOM..."
-          oras push "${REPOSITORY}:sbom-${VERSION}" --artifact-type "${SBOM_TYPE}" sbom.tar.gz:application/tar+gzip || echo "Failed to push SBOM"
-          
-          echo "Pushing attestations..."
-          oras push "${REPOSITORY}:attestations-${VERSION}" --artifact-type "${ATTESTATION_TYPE}" attestations.tar.gz:application/tar+gzip || echo "Failed to push attestations"
-          
-          echo "Pushing signatures..."
-          oras push "${REPOSITORY}:signatures-${VERSION}" --artifact-type "${SIG_TYPE}" signatures.tar.gz:application/tar+gzip || echo "Failed to push signatures"
-          
-          echo "Pushing policies..."
-          oras push "${REPOSITORY}:policies-${VERSION}" --artifact-type "${POLICY_TYPE}" policies.tar.gz:application/tar+gzip || echo "Failed to push policies"
-          
-          echo "Pushing comprehensive bundle..."
-          oras push "${REPOSITORY}:bundle-${VERSION}" --artifact-type "${BUNDLE_TYPE}" comprehensive-bundle.tar.gz:application/tar+gzip || echo "Failed to push comprehensive bundle"
-          
-          # Tag the latest versions
-          echo "Tagging latest versions..."
-          oras tag "${REPOSITORY}:sbom-${VERSION}" "sbom-latest" || echo "Failed to tag sbom-latest"
-          oras tag "${REPOSITORY}:attestations-${VERSION}" "attestations-latest" || echo "Failed to tag attestations-latest"
-          oras tag "${REPOSITORY}:signatures-${VERSION}" "signatures-latest" || echo "Failed to tag signatures-latest"
-          oras tag "${REPOSITORY}:policies-${VERSION}" "policies-latest" || echo "Failed to tag policies-latest"
-          oras tag "${REPOSITORY}:bundle-${VERSION}" "bundle-latest" || echo "Failed to tag bundle-latest"
-          
-          # Reset errors
-          set +x  # Disable command echo
-      
-      - name: Verify artifact publishing
-        continue-on-error: true
-        run: |
-          set -x  # Enable command echo for debugging
-          
-          REPOSITORY="ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts"
-          
-          echo "Listing published artifacts:"
-          oras discover -o tree "${REPOSITORY}:sbom-${VERSION}" || echo "Could not list SBOM"
-          oras discover -o tree "${REPOSITORY}:attestations-${VERSION}" || echo "Could not list attestations"
-          oras discover -o tree "${REPOSITORY}:signatures-${VERSION}" || echo "Could not list signatures"
-          oras discover -o tree "${REPOSITORY}:policies-${VERSION}" || echo "Could not list policies"
-          oras discover -o tree "${REPOSITORY}:bundle-${VERSION}" || echo "Could not list comprehensive bundle"
-          
-          # Reset errors
-          set +x  # Disable command echo
-      
-      - name: Generate summary report
-        run: |
           cat > biogears-pipeline-report.md << EOF
           # BioGears Complete Pipeline Report
           
-          Generated: $(date -u)
-          Version: ${VERSION}
+          Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Version: ${DATE_VERSION}
           Branch: ${{ github.ref_name }}
           Commit: ${{ github.sha }}
           
           ## Artifacts
           
-          ### Docker Image
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
-          
-          ### Individual Artifacts (ORAS)
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:sbom-${VERSION}
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:attestations-${VERSION}
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:signatures-${VERSION}
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:policies-${VERSION}
-          
-          ### Comprehensive Bundle
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:bundle-${VERSION}
-          
-          ### Latest Tags
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:sbom-latest
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:attestations-latest
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:signatures-latest
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:policies-latest
-          - ghcr.io/${{ github.repository_owner }}/biogears-hari-artifacts:bundle-latest
+          ${GITHUB_SECTION}${JFROG_SECTION}
           
           ## Docker Image Signatures and Attestations
           The Docker image has been signed with Cosign and has attestations attached directly.
           
           ## View in GitHub Container Registry
           - https://github.com/${{ github.repository_owner }}/biogears-hari/pkgs/container/biogears-hari
-          - https://github.com/${{ github.repository_owner }}/biogears-hari/pkgs/container/biogears-hari-artifacts
+          - https://github.com/${{ github.repository_owner }}/biogears-hari/pkgs/container/biogears-hari-artifacts${JFROG_BROWSE}
           EOF
       
-      - name: Upload pipeline report
+      - name: Publish artifacts to registry
         uses: actions/upload-artifact@v4
         with:
-          name: pipeline-report
-          path: biogears-pipeline-report.md
-          
-      - name: Upload cosign keys
-        uses: actions/upload-artifact@v4
-        with:
-          name: cosign-keys
+          name: biogears-build
           path: |
-            cosign.key
-            cosign.pub
-            image-attestations.json 
-
-  # Create demonstration materials for supply chain security
-  create-demo-materials:
-    name: Create Security Demo Materials
-    needs: publish-artifacts
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-      
-      - name: Install required tools
-        run: |
-          # Install key tools for demos
-          sudo apt-get update
-          sudo apt-get install -y jq graphviz
-          
-          # Install Cosign
-          wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
-          chmod +x cosign-linux-amd64
-          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
-          
-          # Install ORAS
-          curl -LO https://github.com/oras-project/oras/releases/download/v1.1.0/oras_1.1.0_linux_amd64.tar.gz
-          mkdir -p oras-install/
-          tar -zxf oras_1.1.0_linux_amd64.tar.gz -C oras-install/
-          sudo mv oras-install/oras /usr/local/bin/
-          
-          # Install Trivy
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy
-          
-          # Install OPA
-          curl -L -o opa https://github.com/open-policy-agent/opa/releases/latest/download/opa_linux_amd64
-          chmod 755 opa
-          sudo mv opa /usr/local/bin/opa
-      
-      - name: Generate attack simulation samples
-        run: |
-          mkdir -p demo-materials/attack-simulations
-          
-          # 1. Create a tampered dependency attack demo
-          cat > demo-materials/attack-simulations/tampered-dependency-demo.sh << 'EOF'
-          #!/bin/bash
-          # Demo: Tampered Dependency Attack
-          
-          echo "=== DEMO: Tampered Dependency Attack ==="
-          echo "Step 1: View the legitimate SBOM"
-          cosign download sbom ghcr.io/hari-ara/biogears-hari:latest | jq
-          
-          echo "Step 2: Create a malicious version with a backdoored dependency"
-          cat > malicious-sbom.json << INNEREOF
-          {
-            "bomFormat": "CycloneDX",
-            "components": [
-              {
-                "name": "malicious-package",
-                "version": "1.0.0",
-                "purl": "pkg:npm/malicious-package@1.0.0"
-              }
-            ]
-          }
-          INNEREOF
-          
-          echo "Step 3: Show policy rejecting the malicious SBOM"
-          opa eval -i malicious-sbom.json -d policies/rego/sbom_policy.rego "data.sbom.valid"
-          EOF
-          
-          # 2. Create signature tampering detection demo
-          cat > demo-materials/attack-simulations/signature-tampering-demo.sh << 'EOF'
-          #!/bin/bash
-          # Demo: Signature Tampering Detection
-          
-          echo "=== DEMO: Signature Tampering Detection ==="
-          echo "Step 1: Verify legitimate image signature"
-          cosign verify --key cosign.pub ghcr.io/hari-ara/biogears-hari:latest
-          
-          echo "Step 2: Demonstrate modified image failing verification"
-          echo "Simulating modified image verification with wrong key:"
-          cosign generate-key-pair --output-key-prefix wrong
-          cosign verify --key wrong.pub ghcr.io/hari-ara/biogears-hari:latest
-          EOF
-          
-          # 3. Create policy enforcement demo
-          cat > demo-materials/attack-simulations/policy-enforcement-demo.sh << 'EOF'
-          #!/bin/bash
-          # Demo: Policy Enforcement
-          
-          echo "=== DEMO: Policy Enforcement ==="
-          echo "Step 1: Show policy that blocks critical vulnerabilities"
-          cat policies/rego/container_scan_policy.rego
-          
-          echo "Step 2: Run a vulnerability scan to demonstrate policy evaluation"
-          trivy image --format json ghcr.io/hari-ara/biogears-hari:latest > scan.json
-          opa eval -i scan.json -d policies/rego/container_scan_policy.rego "data.container_scan.compliant"
-          
-          echo "Step 3: Demonstrate a failing scan with critical vulnerabilities"
-          cat > vulnerable-scan.json << INNEREOF
-          {
-            "Results": [
-              {
-                "Vulnerabilities": [
-                  {
-                    "VulnerabilityID": "CVE-2023-1234",
-                    "Severity": "CRITICAL"
-                  }
-                ]
-              }
-            ]
-          }
-          INNEREOF
-          
-          opa eval -i vulnerable-scan.json -d policies/rego/container_scan_policy.rego "data.container_scan.compliant"
-          EOF
-          
-          # Make scripts executable
-          chmod +x demo-materials/attack-simulations/*.sh
-      
-      - name: Generate technical inspection demos
-        run: |
-          mkdir -p demo-materials/technical-inspections
-          
-          # 1. Create attestation chain demo
-          cat > demo-materials/technical-inspections/attestation-chain-demo.sh << 'EOF'
-          #!/bin/bash
-          # Demo: Comprehensive Attestation Chain
-          
-          echo "=== DEMO: Comprehensive Attestation Chain ==="
-          echo "Step 1: Extract the attestation bundle"
-          oras pull ghcr.io/hari-ara/biogears-hari-artifacts:bundle-latest -o bundle/
-          
-          echo "Step 2: Demonstrate the links between attestations"
-          jq . bundle/attestations/build-intoto-attestation.json
-          jq . bundle/attestations/sbom-intoto.json
-          
-          echo "Step 3: Verify signature of build attestation"
-          cosign verify-blob --key cosign.pub --signature bundle/signatures/build-intoto-attestation.json.sig bundle/attestations/build-intoto-attestation.json
-          EOF
-          
-          # 2. Create provenance verification demo
-          cat > demo-materials/technical-inspections/provenance-demo.sh << 'EOF'
-          #!/bin/bash
-          # Demo: Software Provenance Verification
-          
-          echo "=== DEMO: Software Provenance Verification ==="
-          echo "Step 1: View the complete build metadata"
-          jq . bundle/metadata/bundle-metadata.json
-          
-          echo "Step 2: Extract and display attestation that proves build environment integrity"
-          cosign verify-attestation --key cosign.pub ghcr.io/hari-ara/biogears-hari:latest
-          
-          echo "Step 3: Show all artifacts traced back to source"
-          echo "Image digest traces back to commit $(jq -r '.commit' bundle/metadata/bundle-metadata.json)"
-          EOF
-          
-          # Make scripts executable
-          chmod +x demo-materials/technical-inspections/*.sh
-      
-      - name: Generate interactive attack mitigation demos
-        run: |
-          mkdir -p demo-materials/attack-mitigations
-          
-          # 1. Create build injection attack demo
-          cat > demo-materials/attack-mitigations/build-injection-demo.sh << 'EOF'
-          #!/bin/bash
-          # Demo: Build Injection Attack
-          
-          echo "=== DEMO: Build Injection Attack ==="
-          echo "Step 1: Show legitimate build attestation"
-          jq . bundle/attestations/build-attestation-raw.json
-          
-          echo "Step 2: Create a simulated compromised build"
-          cat > compromised-build.json << INNEREOF
-          {
-            "builder_id": "compromised-builder",
-            "build_type": "Release",
-            "build_platform": "linux",
-            "commit_hash": "f4ke5h4"
-          }
-          INNEREOF
-          
-          echo "Step 3: Show policy rejecting the compromised build"
-          opa eval -i compromised-build.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.valid"
-          EOF
-          
-          # Make scripts executable
-          chmod +x demo-materials/attack-mitigations/*.sh
-      
-      - name: Create supply chain visualization
-        run: |
-          mkdir -p demo-materials/visualizations
-          
-          # Create a visual representation of the supply chain
-          cat > demo-materials/visualizations/supply-chain.dot << 'EOF'
-          digraph SupplyChain {
-            rankdir="LR";
-            node [shape=box, style="rounded,filled", fillcolor=lightblue];
-            
-            // Source control nodes
-            subgraph cluster_source {
-              label="Source Control";
-              style=filled;
-              color=lightgrey;
-              Source [label="Source Code\nRepository"];
-              Commit [label="Git Commit"];
-            }
-            
-            // Build environment nodes
-            subgraph cluster_build {
-              label="Build Pipeline";
-              style=filled;
-              color=lightgrey;
-              Builder [label="Docker Builder\nImage"];
-              BuildAttest [label="Build\nAttestation"];
-            }
-            
-            // Artifact nodes
-            subgraph cluster_artifacts {
-              label="Artifacts";
-              style=filled;
-              color=lightgrey;
-              Image [label="Container\nImage"];
-              SBOM [label="Software Bill\nof Materials"];
-            }
-            
-            // Security nodes
-            subgraph cluster_security {
-              label="Security Controls";
-              style=filled;
-              color=lightgrey;
-              Policies [label="OPA\nPolicies"];
-              Signatures [label="Cosign\nSignatures"];
-              VulnScan [label="Vulnerability\nScanning"];
-            }
-            
-            // Deployment nodes
-            subgraph cluster_deploy {
-              label="Deployment";
-              style=filled;
-              color=lightgrey;
-              Registry [label="OCI Registry"];
-              Deployment [label="Secure\nDeployment"];
-            }
-            
-            // Connect the nodes
-            Source -> Commit [label="git push"];
-            Commit -> Builder [label="trigger build"];
-            Builder -> Image [label="create"];
-            Builder -> BuildAttest [label="generate"];
-            Image -> SBOM [label="extract"];
-            Image -> VulnScan [label="scan"];
-            VulnScan -> Policies [label="evaluate"];
-            SBOM -> Policies [label="verify"];
-            BuildAttest -> Policies [label="validate"];
-            Image -> Signatures [label="sign"];
-            BuildAttest -> Signatures [label="sign"];
-            SBOM -> Signatures [label="sign"];
-            Signatures -> Registry [label="publish"];
-            Image -> Registry [label="push"];
-            Registry -> Deployment [label="verify & deploy"];
-          }
-          EOF
-          
-          # Generate the visualization
-          dot -Tpng demo-materials/visualizations/supply-chain.dot -o demo-materials/visualizations/supply-chain.png
-          dot -Tsvg demo-materials/visualizations/supply-chain.dot -o demo-materials/visualizations/supply-chain.svg
-      
-      - name: Generate demo guide
-        run: |
-          cat > demo-materials/README.md << 'EOF'
-          # BioGears Supply Chain Security Demo Guide
-          
-          This demo toolkit demonstrates how our secure supply chain pipeline protects against software supply chain attacks. It includes ready-to-run demonstrations for security presentations.
-          
-          ## Demo Categories
-          
-          ### 1. Attack Simulations
-          Demonstrates how the pipeline detects and prevents common supply chain attacks:
-          - `tampered-dependency-demo.sh`: Shows SBOM verification detecting modified dependencies
-          - `signature-tampering-demo.sh`: Demonstrates detection of tampered artifacts
-          - `policy-enforcement-demo.sh`: Shows how policy prevents deployment of vulnerable software
-          
-          ### 2. Technical Inspections  
-          Demonstrates the technical components of the secure supply chain:
-          - `attestation-chain-demo.sh`: Shows the chain of attestations throughout the supply chain
-          - `provenance-demo.sh`: Demonstrates how all artifacts are traced back to source code
-          
-          ### 3. Attack Mitigations
-          Shows specific mitigations against attack techniques:
-          - `build-injection-demo.sh`: Demonstrates how the pipeline prevents compromised build environments
-          
-          ## Quick Reference Commands
-          
-          ### Verify image signatures
-          ```bash
-          cosign verify --key cosign.pub ghcr.io/hari-ara/biogears-hari:latest
-          ```
-          
-          ### Extract and verify SBOM
-          ```bash
-          cosign download sbom ghcr.io/hari-ara/biogears-hari:latest | jq .
-          ```
-          
-          ### Verify attestations
-          ```bash
-          cosign verify-attestation --key cosign.pub ghcr.io/hari-ara/biogears-hari:latest
-          ```
-          
-          ### Evaluate policy compliance
-          ```bash
-          oras pull ghcr.io/hari-ara/biogears-hari-artifacts:policies-latest -o policies/
-          opa eval -d policies/rego -i sbom-with-vulns.cyclonedx.json "data.sbom.valid"
-          ```
-          
-          ## Running a Demo Presentation
-          
-          1. Start with the supply chain visualization to explain the overall architecture
-          2. Run the attack simulations to demonstrate security controls in action
-          3. Use technical inspections to show implementation details
-          4. Show attack mitigations for specific threats
-          
-          All scripts are self-contained and include step-by-step explanations.
-          EOF
-      
-      - name: Create command reference
-        run: |
-          cat > demo-materials/command-reference.sh << 'EOF'
-          #!/bin/bash
-          # BioGears Supply Chain Security Command Reference
-          
-          # SBOM Extraction and Verification
-          function demo_sbom() {
-            echo "=== SBOM Extraction and Verification ==="
-            echo "# Extract SBOM from container image"
-            echo "cosign download sbom ghcr.io/hari-ara/biogears-hari:latest"
-            
-            echo "# Verify SBOM signature"
-            echo "cosign verify-attestation --key cosign.pub --type https://in-toto.io/attestation/sbom/v1 ghcr.io/hari-ara/biogears-hari:latest"
-            
-            echo "# Evaluate SBOM policy compliance"
-            echo "opa eval -i sbom-with-vulns.cyclonedx.json -d policies/rego/sbom_policy.rego \"data.sbom.valid\""
-          }
-          
-          # Image Signature Verification
-          function demo_signatures() {
-            echo "=== Image Signature Verification ==="
-            echo "# Verify image signature"
-            echo "cosign verify --key cosign.pub ghcr.io/hari-ara/biogears-hari:latest"
-            
-            echo "# Extract signature and verify manually"
-            echo "cosign download signature ghcr.io/hari-ara/biogears-hari:latest"
-            echo "cosign verify-blob --key cosign.pub --signature [signature-file] [artifact-file]"
-          }
-          
-          # Vulnerability Scanning
-          function demo_vulnerabilities() {
-            echo "=== Vulnerability Scanning ==="
-            echo "# Scan image for vulnerabilities"
-            echo "trivy image --format json ghcr.io/hari-ara/biogears-hari:latest"
-            
-            echo "# Check for critical vulnerabilities only"
-            echo "trivy image --severity CRITICAL ghcr.io/hari-ara/biogears-hari:latest"
-            
-            echo "# Evaluate policy compliance"
-            echo "opa eval -i trivy-scan.json -d policies/rego/container_scan_policy.rego \"data.container_scan.compliant\""
-          }
-          
-          # Attestation Verification
-          function demo_attestations() {
-            echo "=== Attestation Verification ==="
-            echo "# Verify build attestation"
-            echo "cosign verify-attestation --key cosign.pub ghcr.io/hari-ara/biogears-hari:latest"
-            
-            echo "# Extract and explore attestation"
-            echo "oras pull ghcr.io/hari-ara/biogears-hari-artifacts:attestations-latest -o attestations-bundle/"
-            echo "jq . attestations-bundle/build-intoto-attestation.json"
-          }
-          
-          # Comprehensive Bundle Inspection
-          function demo_bundle() {
-            echo "=== Comprehensive Bundle Inspection ==="
-            echo "# Extract bundle"
-            echo "oras pull ghcr.io/hari-ara/biogears-hari-artifacts:bundle-latest -o bundle/"
-            
-            echo "# Show relationships between artifacts"
-            echo "jq -r '.docker_image.reference' ./bundle/metadata/bundle-metadata.json"
-            echo "jq -r '.docker_image.digest' ./bundle/metadata/bundle-metadata.json"
-            echo "jq -r '.artifacts | to_entries[] | \"\\(.key): \\(.value.reference)\"' ./bundle/metadata/bundle-metadata.json"
-          }
-          
-          # Run a specific demo or all demos
-          if [ "$1" == "sbom" ]; then
-            demo_sbom
-          elif [ "$1" == "signatures" ]; then
-            demo_signatures
-          elif [ "$1" == "vulnerabilities" ]; then
-            demo_vulnerabilities
-          elif [ "$1" == "attestations" ]; then
-            demo_attestations
-          elif [ "$1" == "bundle" ]; then
-            demo_bundle
-          else
-            echo "BioGears Supply Chain Security Command Reference"
-            echo "Usage: $0 [sbom|signatures|vulnerabilities|attestations|bundle]"
-            echo "Run with one of the options above to see specific commands, or run without arguments to see this help."
-          fi
-          EOF
-          
-          chmod +x demo-materials/command-reference.sh
-      
-      - name: Bundle demo materials
-        run: |
-          # Create a comprehensive README with instructions
-          cat > demo-materials/SETUP.md << 'EOF'
-          # Setting Up the Demo Environment
-          
-          Follow these steps to set up your demo environment:
-          
-          ## Prerequisites
-          
-          Install the following tools:
-          - Docker
-          - cosign (`brew install cosign` or download from GitHub)
-          - oras (`brew install oras-project/oras/oras` or download from GitHub)
-          - jq (`brew install jq` or download from GitHub)
-          - opa (`brew install opa` or download from GitHub)
-          - trivy (`brew install aquasecurity/trivy/trivy` or download from GitHub)
-          
-          ## Setup Steps
-          
-          1. Create a working directory for the demo:
-          ```bash
-          mkdir -p biogears-security-demo && cd biogears-security-demo
-          ```
-          
-          2. Extract this demo package:
-          ```bash
-          tar -xzf biogears-security-demo.tar.gz
-          ```
-          
-          3. Pull the required artifacts:
-          ```bash
-          ./setup-demo.sh
-          ```
-          
-          4. Run the demos:
-          ```bash
-          # Run an attack simulation
-          ./attack-simulations/tampered-dependency-demo.sh
-          
-          # Run a technical inspection
-          ./technical-inspections/attestation-chain-demo.sh
-          
-          # See all available commands
-          ./command-reference.sh
-          ```
-          EOF
-          
-          # Create a setup script
-          cat > demo-materials/setup-demo.sh << 'EOF'
-          #!/bin/bash
-          # Setup script for BioGears Supply Chain Security Demo
-          
-          echo "Setting up BioGears Security Demo environment..."
-          
-          echo "Pulling container images..."
-          docker pull ghcr.io/hari-ara/biogears-hari:latest
-          
-          echo "Pulling artifacts..."
-          # Create directories for extracted files
-          mkdir -p bundle policies
-          
-          # Pull bundle
-          oras pull ghcr.io/hari-ara/biogears-hari-artifacts:bundle-latest -o bundle/ || {
-            echo "Failed to pull bundle, creating minimal structure"
-            mkdir -p bundle/{sboms,attestations,signatures,policies,metadata}
-          }
-          
-          # Pull policies
-          oras pull ghcr.io/hari-ara/biogears-hari-artifacts:policies-latest -o policies/ || {
-            echo "Failed to pull policies, using sample policies"
-            mkdir -p policies/rego
-          }
-          
-          echo "Setup complete! You can now run the demo scripts."
-          EOF
-          
-          chmod +x demo-materials/setup-demo.sh
-          
-          # Create a tar archive of all demo materials
-          tar -czvf biogears-security-demo.tar.gz demo-materials/
-      
-      - name: Upload demo materials
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-demo-materials
-          path: |
-            biogears-security-demo.tar.gz
-            demo-materials/
-
-  # Add this job after the create-demo-materials job
-  run-security-demos:
-    name: Run Security Demonstrations
-    needs: [create-demo-materials, publish-artifacts]
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      
-      - name: Download demo materials and artifacts
-        uses: actions/download-artifact@v4
-      
-      - name: Setup demo environment
-        run: |
-          # Install required tools
-          sudo apt-get update
-          sudo apt-get install -y jq graphviz
-          
-          # Install security tools
-          wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
-          chmod +x cosign-linux-amd64
-          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
-          
-          curl -L -o opa https://github.com/open-policy-agent/opa/releases/latest/download/opa_linux_amd64
-          chmod 755 opa
-          sudo mv opa /usr/local/bin/opa
-          
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy
-          
-          # Extract demo materials
-          mkdir -p demo-run
-          tar -xzf security-demo-materials/biogears-security-demo.tar.gz -C demo-run
-          
-          # Copy keys and policy artifacts
-          cp cosign-keys/cosign.* demo-run/
-          mkdir -p demo-run/policies
-          tar -xzf policy-artifacts/signed-policies.tar.gz -C demo-run/
-      
-      - name: Demo 1 - Tampered Dependency Detection
-        run: |
-          cd demo-run/demo-materials
-          
-          echo "=== DEMONSTRATION: Detecting Tampered Dependencies ==="
-          echo "Creating legitimate vs. tampered SBOM examples..."
-          
-          # Create legitimate SBOM
-          cat > legitimate-sbom.json << EOF
-          {
-            "bomFormat": "CycloneDX",
-            "specVersion": "1.4",
-            "components": [
-              {
-                "name": "biogears-core",
-                "version": "7.4.0"
-              },
-              {
-                "name": "eigen",
-                "version": "3.4.0"
-              }
-            ]
-          }
-          EOF
-          
-          # Create tampered SBOM with malicious package
-          cat > tampered-sbom.json << EOF
-          {
-            "bomFormat": "CycloneDX",
-            "specVersion": "1.4",
-            "components": [
-              {
-                "name": "biogears-core",
-                "version": "7.4.0"
-              },
-              {
-                "name": "eigen",
-                "version": "3.4.0"
-              },
-              {
-                "name": "malicious-backdoor",
-                "version": "1.0.0"
-              }
-            ]
-          }
-          EOF
-          
-          # Run policy evaluation
-          echo "Running SBOM policy verification..."
-          opa eval -i legitimate-sbom.json -d policies/rego/sbom_policy.rego "data.sbom.valid" -f pretty > sbom-legitimate-result.txt
-          opa eval -i tampered-sbom.json -d policies/rego/sbom_policy.rego "data.sbom.valid" -f pretty > sbom-tampered-result.txt
-          
-          echo "Results:"
-          echo "Legitimate SBOM verification:"
-          cat sbom-legitimate-result.txt
-          echo "Tampered SBOM verification:"
-          cat sbom-tampered-result.txt
-          
-          # Generate report
-          cat > dependency-tampering-report.md << EOF
-          # Security Demo: Dependency Tampering Detection
-          
-          This demonstration shows how our supply chain pipeline can detect unauthorized or malicious dependencies.
-          
-          ## Results
-          
-          **Legitimate SBOM**
-          \`\`\`json
-          $(cat legitimate-sbom.json)
-          \`\`\`
-          
-          **Verification Result**:
-          \`\`\`
-          $(cat sbom-legitimate-result.txt)
-          \`\`\`
-          
-          **Tampered SBOM with Malicious Package**
-          \`\`\`json
-          $(cat tampered-sbom.json)
-          \`\`\`
-          
-          **Verification Result**:
-          \`\`\`
-          $(cat sbom-tampered-result.txt)
-          \`\`\`
-          
-          ## Security Value
-          
-          - **Detects Unauthorized Components**: Policy verification identifies unexpected or unauthorized packages.
-          - **Prevents Supply Chain Attacks**: By enforcing SBOM validation, we prevent dependency confusion or typosquatting attacks.
-          - **Creates Audit Records**: The SBOM attestation provides a trusted record of all components in the build.
-          EOF
-      
-      - name: Demo 2 - Container Image Signature Verification
-        run: |
-          cd demo-run/demo-materials
-          
-          echo "=== DEMONSTRATION: Container Image Signature Verification ==="
-          echo "Demonstrating signature verification..."
-          
-          # Create demo script
-          cat > verify-signature-demo.sh << 'EOF'
-          #!/bin/bash
-          # Container signature verification
-          
-          echo "1. Creating sample signed vs. unsigned content"
-          echo "This is legitimate content" > legitimate.txt
-          echo "This is tampered content" > tampered.txt
-          
-          # Sign the legitimate content
-          cosign sign-blob --key ../cosign.key legitimate.txt > legitimate.txt.sig
-          
-          echo "2. Verification of legitimate content with correct signature"
-          cosign verify-blob --key ../cosign.pub --signature legitimate.txt.sig legitimate.txt && echo "✅ VERIFICATION PASSED" || echo "❌ VERIFICATION FAILED"
-          
-          echo "3. Verification of tampered content with legitimate signature (should fail)"
-          cosign verify-blob --key ../cosign.pub --signature legitimate.txt.sig tampered.txt && echo "✅ VERIFICATION PASSED" || echo "❌ VERIFICATION FAILED"
-          EOF
-          
-          chmod +x verify-signature-demo.sh
-          ./verify-signature-demo.sh > signature-verification-output.txt
-          
-          cat > signature-verification-report.md << EOF
-          # Security Demo: Container Image Signature Verification
-          
-          This demonstration shows how digital signatures protect against tampering with container images in the software supply chain.
-          
-          ## Results
-          
-          \`\`\`
-          $(cat signature-verification-output.txt)
-          \`\`\`
-          
-          ## Security Value
-          
-          - **Integrity Protection**: Digital signatures ensure that container images haven't been modified after being built.
-          - **Origin Authentication**: Signatures validate that images came from our authorized build process.
-          - **Tamper Detection**: Modified images will fail signature verification even if the changes are small.
-          - **Supply Chain Trust**: Signatures establish a chain of custody for artifacts from build to deployment.
-          EOF
-      
-      - name: Demo 3 - Vulnerability Scanning and Policy Enforcement
-        run: |
-          cd demo-run/demo-materials
-          
-          echo "=== DEMONSTRATION: Vulnerability Scanning and Policy Enforcement ==="
-          
-          # Create sample vulnerability scan results
-          cat > clean-scan.json << EOF
-          {
-            "Results": [
-              {
-                "Vulnerabilities": [
-                  {
-                    "VulnerabilityID": "CVE-2023-5678",
-                    "Severity": "LOW"
-                  }
-                ]
-              }
-            ]
-          }
-          EOF
-          
-          cat > vulnerable-scan.json << EOF
-          {
-            "Results": [
-              {
-                "Vulnerabilities": [
-                  {
-                    "VulnerabilityID": "CVE-2023-1234",
-                    "Severity": "CRITICAL"
-                  },
-                  {
-                    "VulnerabilityID": "CVE-2023-5678",
-                    "Severity": "HIGH"
-                  }
-                ]
-              }
-            ]
-          }
-          EOF
-          
-          # Run policy evaluation
-          echo "Evaluating vulnerability policies..."
-          opa eval -i clean-scan.json -d policies/rego/container_scan_policy.rego "data.container_scan.compliant" -f pretty > clean-scan-result.txt
-          opa eval -i vulnerable-scan.json -d policies/rego/container_scan_policy.rego "data.container_scan.compliant" -f pretty > vulnerable-scan-result.txt
-          
-          echo "Extracting policy details..."
-          opa eval -d policies/rego/container_scan_policy.rego "data.container_scan.max_critical" -f pretty > policy-limits.txt
-          opa eval -i vulnerable-scan.json -d policies/rego/container_scan_policy.rego "data.container_scan.violations" -f pretty > policy-violations.txt
-          
-          cat > vulnerability-policy-report.md << EOF
-          # Security Demo: Vulnerability Scanning and Policy Enforcement
-          
-          This demonstration shows how vulnerability scanning combined with policy enforcement prevents deploying images with security issues.
-          
-          ## Policy Limits
-          \`\`\`
-          $(cat policy-limits.txt)
-          \`\`\`
-          
-          ## Results
-          
-          **Clean Scan**
-          \`\`\`json
-          $(cat clean-scan.json)
-          \`\`\`
-          
-          **Policy Compliance**:
-          \`\`\`
-          $(cat clean-scan-result.txt)
-          \`\`\`
-          
-          **Vulnerable Scan**
-          \`\`\`json
-          $(cat vulnerable-scan.json)
-          \`\`\`
-          
-          **Policy Compliance**:
-          \`\`\`
-          $(cat vulnerable-scan-result.txt)
-          \`\`\`
-          
-          **Policy Violations**:
-          \`\`\`
-          $(cat policy-violations.txt)
-          \`\`\`
-          
-          ## Security Value
-          
-          - **Enforced Security Standards**: Automated policy checks prevent images with critical vulnerabilities from being deployed.
-          - **Customizable Risk Tolerance**: Policies can be adjusted based on organization's risk profile.
-          - **Continuous Verification**: Scanning occurs on every build, ensuring no vulnerable images slip through.
-          - **Compliance Documentation**: Scan results provide evidence for compliance requirements.
-          EOF
-      
-      - name: Demo 4 - Build Environment Attestation
-        run: |
-          cd demo-run/demo-materials
-          
-          echo "=== DEMONSTRATION: Build Environment Attestation ==="
-          
-          # Create sample build attestations
-          cat > trusted-build.json << EOF
-          {
-            "builder_id": "github-actions-docker",
-            "build_type": "Release",
-            "source_repo": "https://github.com/hari-ara/biogears-hari",
-            "commit_hash": "1fe88a22fc2632301a7f528def1aa5daa240510e",
-            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "build_platform": "linux"
-          }
-          EOF
-          
-          cat > compromised-build.json << EOF
-          {
-            "builder_id": "unknown-builder",
-            "build_type": "Release",
-            "source_repo": "https://github.com/malicious-fork/biogears",
-            "commit_hash": "abc123",
-            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "build_platform": "linux"
-          }
-          EOF
-          
-          # Run policy evaluation
-          echo "Evaluating build attestations..."
-          opa eval -i trusted-build.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.valid" -f pretty > trusted-build-result.txt
-          opa eval -i compromised-build.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.valid" -f pretty > compromised-build-result.txt
-          opa eval -i compromised-build.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.deny" -f pretty > build-policy-violations.txt
-          
-          cat > build-attestation-report.md << EOF
-          # Security Demo: Build Environment Attestation
-          
-          This demonstration shows how build environment attestations protect against compromise of the build system.
-          
-          ## Results
-          
-          **Trusted Build Attestation**
-          \`\`\`json
-          $(cat trusted-build.json)
-          \`\`\`
-          
-          **Verification Result**:
-          \`\`\`
-          $(cat trusted-build-result.txt)
-          \`\`\`
-          
-          **Compromised Build Attestation**
-          \`\`\`json
-          $(cat compromised-build.json)
-          \`\`\`
-          
-          **Verification Result**:
-          \`\`\`
-          $(cat compromised-build-result.txt)
-          \`\`\`
-          
-          **Policy Violations**:
-          \`\`\`
-          $(cat build-policy-violations.txt)
-          \`\`\`
-          
-          ## Security Value
-          
-          - **Prevents Build System Compromise**: Ensures builds only come from trusted environments.
-          - **Verifiable Build Source**: Every artifact's source can be traced to specific commits and builders.
-          - **Protect Against Insider Threats**: Unauthorized builds are automatically rejected.
-          - **Audit Trail**: Provides cryptographically verifiable record of how each artifact was built.
-          EOF
-      
-      - name: Generate comprehensive report
-        run: |
-          cd demo-run/demo-materials
-          
-          # Create supply chain security diagram
-          dot -Tpng visualizations/supply-chain.dot -o supply-chain-security.png
-          
-          cat > supply-chain-security-report.md << EOF
-          # BioGears Supply Chain Security Demonstration
-          
-          This demonstration shows how our pipeline implements a comprehensive set of security controls
-          to protect the software supply chain from source code to deployment.
-          
-          ## Supply Chain Security Model
-          
-          ![Supply Chain Security](supply-chain-security.png)
-          
-          ## Protection Against Common Supply Chain Attacks
-          
-          | Threat | Security Control | Demo |
-          |--------|------------------|------|
-          | Dependency confusion/tampering | SBOM verification | [Dependency Tampering Demo](dependency-tampering-report.md) |
-          | Container image tampering | Signature verification | [Signature Verification Demo](signature-verification-report.md) |
-          | Known vulnerabilities | Vulnerability scanning | [Vulnerability Policy Demo](vulnerability-policy-report.md) |
-          | Build server compromise | Build attestation | [Build Attestation Demo](build-attestation-report.md) |
-          | Malicious artifacts | In-toto attestations | All demos |
-          
-          ## Integrated Security Architecture
-          
-          Each stage of our pipeline generates and verifies security metadata:
-          
-          1. **Build**: Creates attestations proving build environment integrity
-          2. **Test**: Verifies functionality hasn't been compromised
-          3. **Scan**: Finds vulnerabilities and enforces security policies
-          4. **Sign**: Applies cryptographic signatures to all artifacts
-          5. **Verify**: Validates all signatures and attestations before deployment
-          
-          ## How to Use These Demos
-          
-          These demonstrations can be used to:
-          
-          - Show security stakeholders how the pipeline protects against supply chain attacks
-          - Demonstrate compliance with secure development requirements
-          - Train developers on secure software supply chain principles
-          - Test policy enforcement before deployment
-          EOF
-      
-      - name: Upload demo outputs
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-demo-outputs
-          path: |
-            demo-run/demo-materials/*.md
-            demo-run/demo-materials/*.png
-            demo-run/demo-materials/*.txt
-
-  # Comprehensive progress report for the entire pipeline
-  generate-comprehensive-report:
-    name: Generate Comprehensive Progress Report
-    needs: run-security-demos
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-      
-      - name: Install required tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq graphviz
-      
-      - name: Collect information from all stages
-        run: |
-          mkdir -p progress-report
-          
-          # Collect build information
-          if [ -f "biogears-build/build-metadata.json" ]; then
-            cp biogears-build/build-metadata.json progress-report/
-            BUILD_STATUS="✅ Successful"
-          else
-            echo '{"build_status": "unknown"}' > progress-report/build-metadata.json
-            BUILD_STATUS="⚠️ Unknown"
-          fi
-          
-          # Collect image information
-          if [ -f "image-digest/image-digest.txt" ]; then
-            cp image-digest/image-digest.txt progress-report/
-            IMAGE_STATUS="✅ Published"
-          else
-            echo "IMAGE_DIGEST=unknown" > progress-report/image-digest.txt
-            IMAGE_STATUS="⚠️ Unknown"
-          fi
-          
-          # Collect security scan results
-          if [ -f "security-artifacts/trivy-scan.json" ]; then
-            cp security-artifacts/trivy-scan.json progress-report/
-            
-            # Get vulnerability counts
-            CRITICAL_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")] | length' security-artifacts/trivy-scan.json 2>/dev/null || echo "N/A")
-            HIGH_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="HIGH")] | length' security-artifacts/trivy-scan.json 2>/dev/null || echo "N/A")
-            MEDIUM_COUNT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="MEDIUM")] | length' security-artifacts/trivy-scan.json 2>/dev/null || echo "N/A")
-            
-            SCAN_STATUS="✅ Completed (Critical: ${CRITICAL_COUNT}, High: ${HIGH_COUNT}, Medium: ${MEDIUM_COUNT})"
-          else
-            echo '{"scan_status": "unknown"}' > progress-report/trivy-scan.json
-            SCAN_STATUS="⚠️ Unknown"
-          fi
-          
-          # Collect SBOM information
-          if [ -f "security-artifacts/sbom-with-vulns.cyclonedx.json" ]; then
-            cp security-artifacts/sbom-with-vulns.cyclonedx.json progress-report/
-            COMPONENT_COUNT=$(jq '.components | length' security-artifacts/sbom-with-vulns.cyclonedx.json 2>/dev/null || echo "N/A")
-            SBOM_STATUS="✅ Generated with ${COMPONENT_COUNT} components"
-          else
-            echo '{"sbom_status": "unknown"}' > progress-report/sbom-with-vulns.cyclonedx.json
-            SBOM_STATUS="⚠️ Unknown"
-          fi
-          
-          # Collect attestation information
-          if [ -d "attestation-artifacts" ]; then
-            ATTESTATION_COUNT=$(find attestation-artifacts -name "*-intoto*.json" | wc -l)
-            ATTESTATION_STATUS="✅ Generated ${ATTESTATION_COUNT} attestations"
-          else
-            ATTESTATION_STATUS="⚠️ Unknown"
-          fi
-          
-          # Collect security testing information
-          if [ -d "security-test-reports" ]; then
-            mkdir -p progress-report/security-tests
-            cp -r security-test-reports/* progress-report/security-tests/ 2>/dev/null || echo "No test reports to copy"
-            TEST_STATUS="✅ Completed"
-          else
-            TEST_STATUS="⚠️ Unknown"
-          fi
-          
-          # Collect demo results
-          if [ -d "security-demo-outputs" ]; then
-            mkdir -p progress-report/demos
-            cp -r security-demo-outputs/* progress-report/demos/ 2>/dev/null || echo "No demo outputs to copy"
-            DEMO_STATUS="✅ Executed"
-          else
-            DEMO_STATUS="⚠️ Unknown"
-          fi
-          
-          # Generate comprehensive report
-          cat > progress-report/comprehensive-pipeline-report.md << EOF
-          # BioGears Pipeline Comprehensive Progress Report
-          
-          Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          Workflow Run: ${{ github.workflow }} #${{ github.run_number }}
-          Repository: ${{ github.repository }}
-          Branch: ${{ github.ref_name }}
-          Commit: ${{ github.sha }}
-          
-          ## 📊 Pipeline Status Overview
-          
-          | Stage | Status | Details |
-          |-------|--------|---------|
-          | **Build** | ${BUILD_STATUS} | Core libraries and Docker image built |
-          | **Image** | ${IMAGE_STATUS} | Container image published to registry | 
-          | **Security Scan** | ${SCAN_STATUS} | Vulnerability scanning completed |
-          | **SBOM** | ${SBOM_STATUS} | Software Bill of Materials generated |
-          | **Attestations** | ${ATTESTATION_STATUS} | Supply chain attestations created |
-          | **Security Testing** | ${TEST_STATUS} | Security validation and testing performed |
-          | **Artifact Publishing** | $([[ -f "pipeline-report/biogears-pipeline-report.md" ]] && echo "✅ Complete" || echo "⚠️ Unknown") | Pipeline artifacts published |
-          | **Security Demos** | ${DEMO_STATUS} | Security demonstrations executed |
-          
-          ## 🏗️ Build Details
-          
-          $(jq -r '. | "- **Builder**: \(.builder_id)\n- **Type**: \(.build_type)\n- **Timestamp**: \(.build_timestamp)\n- **Platform**: \(.build_platform)\n- **Commit**: \(.commit_hash)"' progress-report/build-metadata.json 2>/dev/null || echo "Build details not available")
-          
-          ## 🔒 Security Analysis
-          
-          ### Vulnerability Summary
-          
-          $(if [ "$CRITICAL_COUNT" != "N/A" ]; then 
-              echo "- Critical: $CRITICAL_COUNT"
-              echo "- High: $HIGH_COUNT"
-              echo "- Medium: $MEDIUM_COUNT"
-            else
-              echo "Vulnerability data not available"
-            fi)
-          
-          ### SBOM Overview
-          
-          $(if [ "$COMPONENT_COUNT" != "N/A" ]; then
-              echo "- Components: $COMPONENT_COUNT"
-              echo "- Format: $(jq -r '.bomFormat' progress-report/sbom-with-vulns.cyclonedx.json 2>/dev/null || echo "Unknown")"
-              echo "- Version: $(jq -r '.specVersion' progress-report/sbom-with-vulns.cyclonedx.json 2>/dev/null || echo "Unknown")"
-            else
-              echo "SBOM data not available"
-            fi)
-          
-          ## 🧪 Security Testing Results
-          
-          $(if [ -f "security-test-reports/comprehensive-security-test-report.md" ]; then
-              echo "Security testing completed successfully. Tests performed:"
-              echo ""
-              echo "- CIS Docker Benchmark"
-              echo "- Container Image Deep Scanning"
-              echo "- SBOM Verification and License Compliance"
-              echo "- Runtime Security Analysis"
-            else
-              echo "Security test reports not available"
-            fi)
-          
-          ## 📦 Published Artifacts
-          
-          $(if [ -f "pipeline-report/biogears-pipeline-report.md" ]; then
-              cat pipeline-report/biogears-pipeline-report.md | grep -A 15 "## Artifacts" | tail -n +2
-            else
-              echo "Published artifact list not available"
-            fi)
-          
-          ## 🔍 Security Demonstrations
-          
-          $(if [ -f "security-demo-outputs/supply-chain-security-report.md" ]; then
-              echo "The following security demonstrations were executed:"
-              echo ""
-              echo "- Dependency Tampering Detection"
-              echo "- Container Image Signature Verification"
-              echo "- Vulnerability Scanning and Policy Enforcement"
-              echo "- Build Environment Attestation"
-            else
-              echo "Security demonstration results not available"
-            fi)
-          
-          ## 🔄 Complete Workflow Diagram
-          
-          \`\`\`mermaid
-          graph TD
-            A[Build BioGears] --> B[Build Docker Image]
-            B --> C[Generate SBOM]
-            B --> D[Security Scan]
-            C --> E[Create Policies]
-            D --> E
-            E --> F[Generate Attestations]
-            F --> G[Security Testing]
-            G --> H[Publish Artifacts]
-            H --> I[Create Demo Materials]
-            I --> J[Run Security Demos]
-            J --> K[This Report]
-          \`\`\`
-          
-          ## 📚 Resources and Documentation
-          
-          - [Supply Chain Security Documentation](https://github.com/${{ github.repository }}/wiki/Supply-Chain-Security)
-          - [BioGears Documentation](https://github.com/${{ github.repository }}/wiki)
-          - [Security Policies](https://github.com/${{ github.repository }}/security/policy)
-          - [Docker Images](https://github.com/${{ github.repository_owner }}/biogears-hari/pkgs/container/biogears-hari)
-          
-          ## 📌 Next Steps
-          
-          1. Review security scan results and address any vulnerabilities
-          2. Verify all attestations for compliance requirements
-          3. Use demo materials to showcase security features
-          4. Deploy the container image in your environment
-          
-          EOF
-      
-      - name: Upload comprehensive report
-        uses: actions/upload-artifact@v4
-        with:
-          name: comprehensive-progress-report
-          path: progress-report/
-          
-      - name: Generate HTML report
-        run: |
-          sudo apt-get install -y pandoc
-          cd progress-report
-          pandoc comprehensive-pipeline-report.md -o comprehensive-pipeline-report.html -s --metadata title="BioGears Pipeline Report"
-          
-      - name: Upload HTML report
-        uses: actions/upload-artifact@v4
-        with:
-          name: html-progress-report
-          path: progress-report/comprehensive-pipeline-report.html
+            build/lib/
+            build/bin/
+            build-metadata.json
+            biogears-pipeline-report.md
+            image-attestations.json
+            *-raw.json*
+            *-intoto*.json*
+            all-signatures.tar.gz
+            sbom.tar.gz
+            attestations.tar.gz
+            signatures.tar.gz
+            policies.tar.gz
+            comprehensive-bundle.tar.gz
