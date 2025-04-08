@@ -2295,3 +2295,412 @@ jobs:
           path: |
             biogears-security-demo.tar.gz
             demo-materials/
+
+  # Add this job after the create-demo-materials job
+  run-security-demos:
+    name: Run Security Demonstrations
+    needs: [create-demo-materials, publish-artifacts]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download demo materials and artifacts
+        uses: actions/download-artifact@v4
+      
+      - name: Setup demo environment
+        run: |
+          # Install required tools
+          sudo apt-get update
+          sudo apt-get install -y jq graphviz
+          
+          # Install security tools
+          wget -q https://github.com/sigstore/cosign/releases/download/v1.13.1/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          
+          curl -L -o opa https://github.com/open-policy-agent/opa/releases/latest/download/opa_linux_amd64
+          chmod 755 opa
+          sudo mv opa /usr/local/bin/opa
+          
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+          
+          # Extract demo materials
+          mkdir -p demo-run
+          tar -xzf security-demo-materials/biogears-security-demo.tar.gz -C demo-run
+          
+          # Copy keys and policy artifacts
+          cp cosign-keys/cosign.* demo-run/
+          mkdir -p demo-run/policies
+          tar -xzf policy-artifacts/signed-policies.tar.gz -C demo-run/
+      
+      - name: Demo 1 - Tampered Dependency Detection
+        run: |
+          cd demo-run/demo-materials
+          
+          echo "=== DEMONSTRATION: Detecting Tampered Dependencies ==="
+          echo "Creating legitimate vs. tampered SBOM examples..."
+          
+          # Create legitimate SBOM
+          cat > legitimate-sbom.json << EOF
+          {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.4",
+            "components": [
+              {
+                "name": "biogears-core",
+                "version": "7.4.0"
+              },
+              {
+                "name": "eigen",
+                "version": "3.4.0"
+              }
+            ]
+          }
+          EOF
+          
+          # Create tampered SBOM with malicious package
+          cat > tampered-sbom.json << EOF
+          {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.4",
+            "components": [
+              {
+                "name": "biogears-core",
+                "version": "7.4.0"
+              },
+              {
+                "name": "eigen",
+                "version": "3.4.0"
+              },
+              {
+                "name": "malicious-backdoor",
+                "version": "1.0.0"
+              }
+            ]
+          }
+          EOF
+          
+          # Run policy evaluation
+          echo "Running SBOM policy verification..."
+          opa eval -i legitimate-sbom.json -d policies/rego/sbom_policy.rego "data.sbom.valid" -f pretty > sbom-legitimate-result.txt
+          opa eval -i tampered-sbom.json -d policies/rego/sbom_policy.rego "data.sbom.valid" -f pretty > sbom-tampered-result.txt
+          
+          echo "Results:"
+          echo "Legitimate SBOM verification:"
+          cat sbom-legitimate-result.txt
+          echo "Tampered SBOM verification:"
+          cat sbom-tampered-result.txt
+          
+          # Generate report
+          cat > dependency-tampering-report.md << EOF
+          # Security Demo: Dependency Tampering Detection
+          
+          This demonstration shows how our supply chain pipeline can detect unauthorized or malicious dependencies.
+          
+          ## Results
+          
+          **Legitimate SBOM**
+          \`\`\`json
+          $(cat legitimate-sbom.json)
+          \`\`\`
+          
+          **Verification Result**:
+          \`\`\`
+          $(cat sbom-legitimate-result.txt)
+          \`\`\`
+          
+          **Tampered SBOM with Malicious Package**
+          \`\`\`json
+          $(cat tampered-sbom.json)
+          \`\`\`
+          
+          **Verification Result**:
+          \`\`\`
+          $(cat sbom-tampered-result.txt)
+          \`\`\`
+          
+          ## Security Value
+          
+          - **Detects Unauthorized Components**: Policy verification identifies unexpected or unauthorized packages.
+          - **Prevents Supply Chain Attacks**: By enforcing SBOM validation, we prevent dependency confusion or typosquatting attacks.
+          - **Creates Audit Records**: The SBOM attestation provides a trusted record of all components in the build.
+          EOF
+      
+      - name: Demo 2 - Container Image Signature Verification
+        run: |
+          cd demo-run/demo-materials
+          
+          echo "=== DEMONSTRATION: Container Image Signature Verification ==="
+          echo "Demonstrating signature verification..."
+          
+          # Create demo script
+          cat > verify-signature-demo.sh << 'EOF'
+          #!/bin/bash
+          # Container signature verification
+          
+          echo "1. Creating sample signed vs. unsigned content"
+          echo "This is legitimate content" > legitimate.txt
+          echo "This is tampered content" > tampered.txt
+          
+          # Sign the legitimate content
+          cosign sign-blob --key ../cosign.key legitimate.txt > legitimate.txt.sig
+          
+          echo "2. Verification of legitimate content with correct signature"
+          cosign verify-blob --key ../cosign.pub --signature legitimate.txt.sig legitimate.txt && echo "✅ VERIFICATION PASSED" || echo "❌ VERIFICATION FAILED"
+          
+          echo "3. Verification of tampered content with legitimate signature (should fail)"
+          cosign verify-blob --key ../cosign.pub --signature legitimate.txt.sig tampered.txt && echo "✅ VERIFICATION PASSED" || echo "❌ VERIFICATION FAILED"
+          EOF
+          
+          chmod +x verify-signature-demo.sh
+          ./verify-signature-demo.sh > signature-verification-output.txt
+          
+          cat > signature-verification-report.md << EOF
+          # Security Demo: Container Image Signature Verification
+          
+          This demonstration shows how digital signatures protect against tampering with container images in the software supply chain.
+          
+          ## Results
+          
+          \`\`\`
+          $(cat signature-verification-output.txt)
+          \`\`\`
+          
+          ## Security Value
+          
+          - **Integrity Protection**: Digital signatures ensure that container images haven't been modified after being built.
+          - **Origin Authentication**: Signatures validate that images came from our authorized build process.
+          - **Tamper Detection**: Modified images will fail signature verification even if the changes are small.
+          - **Supply Chain Trust**: Signatures establish a chain of custody for artifacts from build to deployment.
+          EOF
+      
+      - name: Demo 3 - Vulnerability Scanning and Policy Enforcement
+        run: |
+          cd demo-run/demo-materials
+          
+          echo "=== DEMONSTRATION: Vulnerability Scanning and Policy Enforcement ==="
+          
+          # Create sample vulnerability scan results
+          cat > clean-scan.json << EOF
+          {
+            "Results": [
+              {
+                "Vulnerabilities": [
+                  {
+                    "VulnerabilityID": "CVE-2023-5678",
+                    "Severity": "LOW"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          
+          cat > vulnerable-scan.json << EOF
+          {
+            "Results": [
+              {
+                "Vulnerabilities": [
+                  {
+                    "VulnerabilityID": "CVE-2023-1234",
+                    "Severity": "CRITICAL"
+                  },
+                  {
+                    "VulnerabilityID": "CVE-2023-5678",
+                    "Severity": "HIGH"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          
+          # Run policy evaluation
+          echo "Evaluating vulnerability policies..."
+          opa eval -i clean-scan.json -d policies/rego/container_scan_policy.rego "data.container_scan.compliant" -f pretty > clean-scan-result.txt
+          opa eval -i vulnerable-scan.json -d policies/rego/container_scan_policy.rego "data.container_scan.compliant" -f pretty > vulnerable-scan-result.txt
+          
+          echo "Extracting policy details..."
+          opa eval -d policies/rego/container_scan_policy.rego "data.container_scan.max_critical" -f pretty > policy-limits.txt
+          opa eval -i vulnerable-scan.json -d policies/rego/container_scan_policy.rego "data.container_scan.violations" -f pretty > policy-violations.txt
+          
+          cat > vulnerability-policy-report.md << EOF
+          # Security Demo: Vulnerability Scanning and Policy Enforcement
+          
+          This demonstration shows how vulnerability scanning combined with policy enforcement prevents deploying images with security issues.
+          
+          ## Policy Limits
+          \`\`\`
+          $(cat policy-limits.txt)
+          \`\`\`
+          
+          ## Results
+          
+          **Clean Scan**
+          \`\`\`json
+          $(cat clean-scan.json)
+          \`\`\`
+          
+          **Policy Compliance**:
+          \`\`\`
+          $(cat clean-scan-result.txt)
+          \`\`\`
+          
+          **Vulnerable Scan**
+          \`\`\`json
+          $(cat vulnerable-scan.json)
+          \`\`\`
+          
+          **Policy Compliance**:
+          \`\`\`
+          $(cat vulnerable-scan-result.txt)
+          \`\`\`
+          
+          **Policy Violations**:
+          \`\`\`
+          $(cat policy-violations.txt)
+          \`\`\`
+          
+          ## Security Value
+          
+          - **Enforced Security Standards**: Automated policy checks prevent images with critical vulnerabilities from being deployed.
+          - **Customizable Risk Tolerance**: Policies can be adjusted based on organization's risk profile.
+          - **Continuous Verification**: Scanning occurs on every build, ensuring no vulnerable images slip through.
+          - **Compliance Documentation**: Scan results provide evidence for compliance requirements.
+          EOF
+      
+      - name: Demo 4 - Build Environment Attestation
+        run: |
+          cd demo-run/demo-materials
+          
+          echo "=== DEMONSTRATION: Build Environment Attestation ==="
+          
+          # Create sample build attestations
+          cat > trusted-build.json << EOF
+          {
+            "builder_id": "github-actions-docker",
+            "build_type": "Release",
+            "source_repo": "https://github.com/hari-ara/biogears-hari",
+            "commit_hash": "1fe88a22fc2632301a7f528def1aa5daa240510e",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "build_platform": "linux"
+          }
+          EOF
+          
+          cat > compromised-build.json << EOF
+          {
+            "builder_id": "unknown-builder",
+            "build_type": "Release",
+            "source_repo": "https://github.com/malicious-fork/biogears",
+            "commit_hash": "abc123",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "build_platform": "linux"
+          }
+          EOF
+          
+          # Run policy evaluation
+          echo "Evaluating build attestations..."
+          opa eval -i trusted-build.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.valid" -f pretty > trusted-build-result.txt
+          opa eval -i compromised-build.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.valid" -f pretty > compromised-build-result.txt
+          opa eval -i compromised-build.json -d policies/rego/build_attestation_policy.rego "data.build_attestation.deny" -f pretty > build-policy-violations.txt
+          
+          cat > build-attestation-report.md << EOF
+          # Security Demo: Build Environment Attestation
+          
+          This demonstration shows how build environment attestations protect against compromise of the build system.
+          
+          ## Results
+          
+          **Trusted Build Attestation**
+          \`\`\`json
+          $(cat trusted-build.json)
+          \`\`\`
+          
+          **Verification Result**:
+          \`\`\`
+          $(cat trusted-build-result.txt)
+          \`\`\`
+          
+          **Compromised Build Attestation**
+          \`\`\`json
+          $(cat compromised-build.json)
+          \`\`\`
+          
+          **Verification Result**:
+          \`\`\`
+          $(cat compromised-build-result.txt)
+          \`\`\`
+          
+          **Policy Violations**:
+          \`\`\`
+          $(cat build-policy-violations.txt)
+          \`\`\`
+          
+          ## Security Value
+          
+          - **Prevents Build System Compromise**: Ensures builds only come from trusted environments.
+          - **Verifiable Build Source**: Every artifact's source can be traced to specific commits and builders.
+          - **Protect Against Insider Threats**: Unauthorized builds are automatically rejected.
+          - **Audit Trail**: Provides cryptographically verifiable record of how each artifact was built.
+          EOF
+      
+      - name: Generate comprehensive report
+        run: |
+          cd demo-run/demo-materials
+          
+          # Create supply chain security diagram
+          dot -Tpng visualizations/supply-chain.dot -o supply-chain-security.png
+          
+          cat > supply-chain-security-report.md << EOF
+          # BioGears Supply Chain Security Demonstration
+          
+          This demonstration shows how our pipeline implements a comprehensive set of security controls
+          to protect the software supply chain from source code to deployment.
+          
+          ## Supply Chain Security Model
+          
+          ![Supply Chain Security](supply-chain-security.png)
+          
+          ## Protection Against Common Supply Chain Attacks
+          
+          | Threat | Security Control | Demo |
+          |--------|------------------|------|
+          | Dependency confusion/tampering | SBOM verification | [Dependency Tampering Demo](dependency-tampering-report.md) |
+          | Container image tampering | Signature verification | [Signature Verification Demo](signature-verification-report.md) |
+          | Known vulnerabilities | Vulnerability scanning | [Vulnerability Policy Demo](vulnerability-policy-report.md) |
+          | Build server compromise | Build attestation | [Build Attestation Demo](build-attestation-report.md) |
+          | Malicious artifacts | In-toto attestations | All demos |
+          
+          ## Integrated Security Architecture
+          
+          Each stage of our pipeline generates and verifies security metadata:
+          
+          1. **Build**: Creates attestations proving build environment integrity
+          2. **Test**: Verifies functionality hasn't been compromised
+          3. **Scan**: Finds vulnerabilities and enforces security policies
+          4. **Sign**: Applies cryptographic signatures to all artifacts
+          5. **Verify**: Validates all signatures and attestations before deployment
+          
+          ## How to Use These Demos
+          
+          These demonstrations can be used to:
+          
+          - Show security stakeholders how the pipeline protects against supply chain attacks
+          - Demonstrate compliance with secure development requirements
+          - Train developers on secure software supply chain principles
+          - Test policy enforcement before deployment
+          EOF
+      
+      - name: Upload demo outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-demo-outputs
+          path: |
+            demo-run/demo-materials/*.md
+            demo-run/demo-materials/*.png
+            demo-run/demo-materials/*.txt
