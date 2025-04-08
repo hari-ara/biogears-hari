@@ -14,7 +14,7 @@ permissions:
 jobs:
   # Build BioGears from source on Linux using Docker
   build-linux:
-    name: Build BioGears (Linux)
+    name: PHASE 1A - Build BioGears (Linux)
     runs-on: ubuntu-latest
     
     steps:
@@ -327,7 +327,7 @@ jobs:
             
   # Build Docker runtime image containing BioGears
   build-docker:
-    name: Build Docker Images
+    name: PHASE 1B - Build Docker Images
     needs: build-linux
     runs-on: ubuntu-latest
     
@@ -561,7 +561,7 @@ jobs:
 
   # Generate SBOM and scan for vulnerabilities
   security-scan:
-    name: Generate SBOM and Scan
+    name: PHASE 2A - Generate SBOM and Scan
     needs: build-docker
     runs-on: ubuntu-latest
     continue-on-error: true  # Allow this job to succeed even if it can't scan
@@ -670,7 +670,7 @@ jobs:
 
   # Create and sign policies
   create-policies:
-    name: Create and Sign Policies
+    name: PHASE 2B - Create and Sign Policies
     runs-on: ubuntu-latest
     
     steps:
@@ -956,7 +956,7 @@ jobs:
 
   # Generate attestations
   generate-attestations:
-    name: Generate Attestations
+    name: PHASE 2C - Generate Attestations
     needs: [build-linux, build-docker, security-scan, create-policies]
     runs-on: ubuntu-latest
     continue-on-error: true  # Allow this job to succeed even if it encounters issues
@@ -1373,10 +1373,298 @@ jobs:
             *-intoto*.json*
             all-signatures.tar.gz
 
-  # Publish artifacts with ORAS
-  publish-artifacts:
-    name: Publish with ORAS
+  # Add comprehensive security testing phase - MOVED BEFORE publish-artifacts
+  security-testing:
+    name: PHASE 3A - Security Testing & Validation
     needs: generate-attestations
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+      
+      - name: Setup testing environment
+        run: |
+          # Install required tools
+          sudo apt-get update
+          sudo apt-get install -y jq curl wget python3-pip clamav clamdscan
+          
+          # Install security testing tools
+          pip3 install bandit safety docker-bench-security
+          
+          # Install Trivy
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+          
+          # Set up test directories
+          mkdir -p security-tests/reports
+          mkdir -p security-tests/results
+          
+          # Pull the Docker image for testing
+          docker pull ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
+      
+      - name: Test 1 - CIS Docker Benchmark
+        run: |
+          echo "=== TESTING: CIS Docker Benchmark ==="
+          echo "Running Docker Bench Security..."
+          
+          # Create a temporary script to run docker-bench-security
+          cat > run-docker-bench.sh << 'EOF'
+          #!/bin/bash
+          docker run --rm --net host --pid host --userns host --cap-add audit_control \
+            -e DOCKER_CONTENT_TRUST=$DOCKER_CONTENT_TRUST \
+            -v /etc:/etc:ro \
+            -v /usr/bin/containerd:/usr/bin/containerd:ro \
+            -v /usr/bin/runc:/usr/bin/runc:ro \
+            -v /usr/lib/systemd:/usr/lib/systemd:ro \
+            -v /var/lib:/var/lib:ro \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            docker/docker-bench-security > docker-bench-results.txt || echo "Docker bench failed but continuing"
+          EOF
+          
+          chmod +x run-docker-bench.sh
+          ./run-docker-bench.sh || echo "Docker bench could not run, continuing with tests"
+          
+          # Generate report (whether the benchmark ran or not)
+          cat > security-tests/reports/docker-benchmark-report.md << EOF
+          # Security Test: CIS Docker Benchmark
+          
+          This test evaluates the Docker configuration against the Center for Internet Security (CIS) Benchmarks.
+          
+          ## Results
+          
+          \`\`\`
+          $(cat docker-bench-results.txt 2>/dev/null || echo "Docker benchmark could not be run in this environment")
+          \`\`\`
+          
+          ## Security Value
+          
+          - **Best Practices**: Ensures Docker is configured according to security best practices
+          - **Reduced Attack Surface**: Identifies configuration issues that could increase attack surface
+          - **Compliance**: Helps meet requirements for various compliance frameworks
+          - **Environment Safety**: Verifies the build environment meets security standards
+          EOF
+      
+      - name: Test 2 - Container Image Scanning
+        run: |
+          echo "=== TESTING: Container Image Deep Scanning ==="
+          
+          # Run advanced Trivy scan with multiple scanners
+          trivy image --format json --security-checks vuln,config,secret --output trivy-all-results.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} || echo "Trivy scan failed but continuing"
+          
+          # Run filesystem scan too
+          trivy image --format json --security-checks config,secret,vuln --output trivy-fs-results.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} || echo "Trivy scan failed but continuing"
+          
+          # Generate summary report
+          cat > security-tests/reports/container-scan-report.md << EOF
+          # Security Test: Container Image Deep Scanning
+          
+          This test performs multiple scanning techniques on the container image to detect vulnerabilities, misconfigurations, and secrets.
+          
+          ## Results
+          
+          ### Vulnerability and Misconfiguration Summary
+          
+          \`\`\`
+          $(trivy image --severity CRITICAL,HIGH --no-progress ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} 2>&1 || echo "Trivy scan could not complete")
+          \`\`\`
+          
+          ### Secret Detection
+          
+          \`\`\`
+          $(trivy image --security-checks secret --no-progress ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} 2>&1 || echo "Trivy scan could not complete")
+          \`\`\`
+          
+          ## Security Value
+          
+          - **Comprehensive Detection**: Identifies software vulnerabilities, misconfigurations, and secrets
+          - **Supply Chain Security**: Verifies no vulnerable or malicious components were introduced
+          - **Defense in Depth**: Multiple scanning techniques provide more thorough coverage
+          - **Evidence**: Provides evidence for audit and compliance purposes
+          EOF
+      
+      - name: Test 3 - SBOM Verification and License Compliance
+        run: |
+          echo "=== TESTING: SBOM Verification and License Compliance ==="
+          
+          # Extract SBOM
+          trivy image --format cyclonedx --output sbom-cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} || echo "SBOM generation failed but continuing"
+          
+          # Create license compliance check
+          cat > license-policy.rego << 'EOF'
+          package sbom.license
+          
+          # List of allowed licenses
+          allowed_licenses = {
+            "Apache-2.0", 
+            "MIT", 
+            "BSD-2-Clause", 
+            "BSD-3-Clause", 
+            "GPL-3.0"
+          }
+          
+          # Check if a license is allowed
+          is_allowed(license) {
+            allowed_licenses[license]
+          }
+          
+          # Find components with disallowed licenses
+          disallowed_components[component] {
+            comp := input.components[_]
+            license := comp.licenses[_].license.id
+            not is_allowed(license)
+            component = {
+              "name": comp.name,
+              "version": comp.version,
+              "license": license
+            }
+          }
+          
+          # SBOM is compliant if there are no disallowed components
+          compliant {
+            count(disallowed_components) == 0
+          }
+          EOF
+          
+          # Generate sample license results (since we might not have actual license data)
+          cat > sample-license-results.json << EOF
+          {
+            "compliant": true,
+            "disallowed_components": []
+          }
+          EOF
+          
+          # Generate report
+          cat > security-tests/reports/sbom-license-report.md << EOF
+          # Security Test: SBOM Verification and License Compliance
+          
+          This test verifies the Software Bill of Materials (SBOM) for completeness and checks for license compliance.
+          
+          ## SBOM Overview
+          
+          \`\`\`
+          $(jq -r '.bomFormat + " version " + .specVersion + " with " + (.components | length | tostring) + " components"' sbom-cyclonedx.json 2>/dev/null || echo "SBOM could not be analyzed")
+          \`\`\`
+          
+          ## License Compliance
+          
+          \`\`\`json
+          $(cat sample-license-results.json)
+          \`\`\`
+          
+          ## Security Value
+          
+          - **License Risk Management**: Identifies components with licenses that could pose legal risk
+          - **Inventory Management**: Maintains accurate inventory of all software components
+          - **Dependency Tracking**: Tracks all dependencies for vulnerability management
+          - **Supply Chain Transparency**: Provides transparency into all components used in the build
+          EOF
+      
+      - name: Test 4 - Runtime Security Analysis
+        run: |
+          echo "=== TESTING: Runtime Security Analysis ==="
+          
+          # Create test script that runs the container and performs runtime analysis
+          cat > runtime-test.sh << 'EOF'
+          #!/bin/bash
+          
+          echo "Running container for analysis..."
+          CONTAINER_ID=$(docker run -d ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }})
+          
+          echo "Analyzing container runtime behavior..."
+          docker top $CONTAINER_ID > runtime-processes.txt
+          docker stats --no-stream $CONTAINER_ID > runtime-resources.txt
+          
+          echo "Generating runtime security profile..."
+          echo "{\"processes\": $(wc -l runtime-processes.txt | cut -d' ' -f1), \"cpu_usage\": \"minimal\", \"memory_usage\": \"minimal\"}" > runtime-analysis.json
+          
+          echo "Stopping container..."
+          docker stop $CONTAINER_ID
+          docker rm $CONTAINER_ID
+          EOF
+          
+          chmod +x runtime-test.sh
+          ./runtime-test.sh || echo "Runtime analysis failed but continuing"
+          
+          # Generate report
+          cat > security-tests/reports/runtime-security-report.md << EOF
+          # Security Test: Runtime Security Analysis
+          
+          This test analyzes the runtime behavior of the container for potential security issues.
+          
+          ## Runtime Analysis
+          
+          \`\`\`json
+          $(cat runtime-analysis.json 2>/dev/null || echo "{\"error\": \"Runtime analysis could not be completed\"}")
+          \`\`\`
+          
+          ## Process List
+          
+          \`\`\`
+          $(cat runtime-processes.txt 2>/dev/null || echo "Process list could not be generated")
+          \`\`\`
+          
+          ## Security Value
+          
+          - **Behavioral Analysis**: Identifies unexpected runtime behavior that could indicate security issues
+          - **Resource Validation**: Ensures container uses resources as expected
+          - **Privilege Checking**: Verifies container runs with appropriate privileges
+          - **Runtime Integrity**: Confirms runtime behavior matches expected patterns
+          EOF
+      
+      - name: Generate comprehensive test report
+        run: |
+          # Create a comprehensive report that includes all test results
+          cat > security-tests/comprehensive-security-test-report.md << EOF
+          # BioGears Comprehensive Security Testing Report
+          
+          This report summarizes the security tests performed on the BioGears container image and associated artifacts.
+          
+          ## Test Summary
+          
+          | Test | Status | Description |
+          |------|--------|-------------|
+          | CIS Docker Benchmark | ✅ Completed | Evaluates Docker configuration against CIS benchmarks |
+          | Container Image Scanning | ✅ Completed | Scans container for vulnerabilities, misconfigurations, and secrets |
+          | SBOM & License Verification | ✅ Completed | Verifies SBOM completeness and license compliance |
+          | Runtime Security Analysis | ✅ Completed | Analyzes container runtime behavior for security issues |
+          
+          ## Testing Value in Software Supply Chain
+          
+          Each phase of testing provides critical security validation:
+          
+          1. **Build Phase Testing**: Validates the build environment and process security
+          2. **Artifact Testing**: Ensures artifacts are free from vulnerabilities
+          3. **Configuration Testing**: Verifies secure configuration practices
+          4. **Runtime Testing**: Confirms secure behavior during execution
+          
+          ## Integration with Supply Chain Security
+          
+          These tests complement the attestations and verifications in the supply chain:
+          
+          - **SBOM verification** ensures no unexpected or malicious components are included
+          - **Container scanning** provides evidence of security characteristics
+          - **Runtime analysis** verifies the container behaves as expected
+          - **Benchmark testing** confirms the infrastructure meets security standards
+          
+          This multi-layered approach creates defense-in-depth for the entire software supply chain.
+          EOF
+      
+      - name: Upload test reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-test-reports
+          path: security-tests/
+
+  # Publish artifacts with ORAS - Updated dependency to depend on security-testing
+  publish-artifacts:
+    name: PHASE 3B - Publish with ORAS
+    needs: security-testing
     runs-on: ubuntu-latest
     continue-on-error: true  # Allow this job to succeed even if there are issues
     
@@ -1793,7 +2081,7 @@ jobs:
 
   # Create demonstration materials for supply chain security
   create-demo-materials:
-    name: Create Security Demo Materials
+    name: PHASE 4A - Create Security Demo Materials
     needs: publish-artifacts
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -2298,7 +2586,7 @@ jobs:
 
   # Add this job after the create-demo-materials job
   run-security-demos:
-    name: Run Security Demonstrations
+    name: PHASE 4B - Run Security Demonstrations
     needs: [create-demo-materials, publish-artifacts]
     runs-on: ubuntu-latest
     
@@ -2704,291 +2992,3 @@ jobs:
             demo-run/demo-materials/*.md
             demo-run/demo-materials/*.png
             demo-run/demo-materials/*.txt
-
-  # Add comprehensive security testing phase
-  security-testing:
-    name: Security Testing Phase
-    needs: [run-security-demos]
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-      
-      - name: Setup testing environment
-        run: |
-          # Install required tools
-          sudo apt-get update
-          sudo apt-get install -y jq curl wget python3-pip clamav clamdscan
-          
-          # Install security testing tools
-          pip3 install bandit safety docker-bench-security
-          
-          # Install Trivy
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy
-          
-          # Set up test directories
-          mkdir -p security-tests/reports
-          mkdir -p security-tests/results
-          
-          # Pull the Docker image for testing
-          docker pull ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
-      
-      - name: Test 1 - CIS Docker Benchmark
-        run: |
-          echo "=== TESTING: CIS Docker Benchmark ==="
-          echo "Running Docker Bench Security..."
-          
-          # Create a temporary script to run docker-bench-security
-          cat > run-docker-bench.sh << 'EOF'
-          #!/bin/bash
-          docker run --rm --net host --pid host --userns host --cap-add audit_control \
-            -e DOCKER_CONTENT_TRUST=$DOCKER_CONTENT_TRUST \
-            -v /etc:/etc:ro \
-            -v /usr/bin/containerd:/usr/bin/containerd:ro \
-            -v /usr/bin/runc:/usr/bin/runc:ro \
-            -v /usr/lib/systemd:/usr/lib/systemd:ro \
-            -v /var/lib:/var/lib:ro \
-            -v /var/run/docker.sock:/var/run/docker.sock:ro \
-            docker/docker-bench-security > docker-bench-results.txt || echo "Docker bench failed but continuing"
-          EOF
-          
-          chmod +x run-docker-bench.sh
-          ./run-docker-bench.sh || echo "Docker bench could not run, continuing with tests"
-          
-          # Generate report (whether the benchmark ran or not)
-          cat > security-tests/reports/docker-benchmark-report.md << EOF
-          # Security Test: CIS Docker Benchmark
-          
-          This test evaluates the Docker configuration against the Center for Internet Security (CIS) Benchmarks.
-          
-          ## Results
-          
-          \`\`\`
-          $(cat docker-bench-results.txt 2>/dev/null || echo "Docker benchmark could not be run in this environment")
-          \`\`\`
-          
-          ## Security Value
-          
-          - **Best Practices**: Ensures Docker is configured according to security best practices
-          - **Reduced Attack Surface**: Identifies configuration issues that could increase attack surface
-          - **Compliance**: Helps meet requirements for various compliance frameworks
-          - **Environment Safety**: Verifies the build environment meets security standards
-          EOF
-      
-      - name: Test 2 - Container Image Scanning
-        run: |
-          echo "=== TESTING: Container Image Deep Scanning ==="
-          
-          # Run advanced Trivy scan with multiple scanners
-          trivy image --format json --security-checks vuln,config,secret --output trivy-all-results.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} || echo "Trivy scan failed but continuing"
-          
-          # Run filesystem scan too
-          trivy image --format json --security-checks config,secret,vuln --output trivy-fs-results.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} || echo "Trivy scan failed but continuing"
-          
-          # Generate summary report
-          cat > security-tests/reports/container-scan-report.md << EOF
-          # Security Test: Container Image Deep Scanning
-          
-          This test performs multiple scanning techniques on the container image to detect vulnerabilities, misconfigurations, and secrets.
-          
-          ## Results
-          
-          ### Vulnerability and Misconfiguration Summary
-          
-          \`\`\`
-          $(trivy image --severity CRITICAL,HIGH --no-progress ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} 2>&1 || echo "Trivy scan could not complete")
-          \`\`\`
-          
-          ### Secret Detection
-          
-          \`\`\`
-          $(trivy image --security-checks secret --no-progress ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} 2>&1 || echo "Trivy scan could not complete")
-          \`\`\`
-          
-          ## Security Value
-          
-          - **Comprehensive Detection**: Identifies software vulnerabilities, misconfigurations, and secrets
-          - **Supply Chain Security**: Verifies no vulnerable or malicious components were introduced
-          - **Defense in Depth**: Multiple scanning techniques provide more thorough coverage
-          - **Evidence**: Provides evidence for audit and compliance purposes
-          EOF
-      
-      - name: Test 3 - SBOM Verification and License Compliance
-        run: |
-          echo "=== TESTING: SBOM Verification and License Compliance ==="
-          
-          # Extract SBOM
-          trivy image --format cyclonedx --output sbom-cyclonedx.json ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }} || echo "SBOM generation failed but continuing"
-          
-          # Create license compliance check
-          cat > license-policy.rego << 'EOF'
-          package sbom.license
-          
-          # List of allowed licenses
-          allowed_licenses = {
-            "Apache-2.0", 
-            "MIT", 
-            "BSD-2-Clause", 
-            "BSD-3-Clause", 
-            "GPL-3.0"
-          }
-          
-          # Check if a license is allowed
-          is_allowed(license) {
-            allowed_licenses[license]
-          }
-          
-          # Find components with disallowed licenses
-          disallowed_components[component] {
-            comp := input.components[_]
-            license := comp.licenses[_].license.id
-            not is_allowed(license)
-            component = {
-              "name": comp.name,
-              "version": comp.version,
-              "license": license
-            }
-          }
-          
-          # SBOM is compliant if there are no disallowed components
-          compliant {
-            count(disallowed_components) == 0
-          }
-          EOF
-          
-          # Generate sample license results (since we might not have actual license data)
-          cat > sample-license-results.json << EOF
-          {
-            "compliant": true,
-            "disallowed_components": []
-          }
-          EOF
-          
-          # Generate report
-          cat > security-tests/reports/sbom-license-report.md << EOF
-          # Security Test: SBOM Verification and License Compliance
-          
-          This test verifies the Software Bill of Materials (SBOM) for completeness and checks for license compliance.
-          
-          ## SBOM Overview
-          
-          \`\`\`
-          $(jq -r '.bomFormat + " version " + .specVersion + " with " + (.components | length | tostring) + " components"' sbom-cyclonedx.json 2>/dev/null || echo "SBOM could not be analyzed")
-          \`\`\`
-          
-          ## License Compliance
-          
-          \`\`\`json
-          $(cat sample-license-results.json)
-          \`\`\`
-          
-          ## Security Value
-          
-          - **License Risk Management**: Identifies components with licenses that could pose legal risk
-          - **Inventory Management**: Maintains accurate inventory of all software components
-          - **Dependency Tracking**: Tracks all dependencies for vulnerability management
-          - **Supply Chain Transparency**: Provides transparency into all components used in the build
-          EOF
-      
-      - name: Test 4 - Runtime Security Analysis
-        run: |
-          echo "=== TESTING: Runtime Security Analysis ==="
-          
-          # Create test script that runs the container and performs runtime analysis
-          cat > runtime-test.sh << 'EOF'
-          #!/bin/bash
-          
-          echo "Running container for analysis..."
-          CONTAINER_ID=$(docker run -d ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }})
-          
-          echo "Analyzing container runtime behavior..."
-          docker top $CONTAINER_ID > runtime-processes.txt
-          docker stats --no-stream $CONTAINER_ID > runtime-resources.txt
-          
-          echo "Generating runtime security profile..."
-          echo "{\"processes\": $(wc -l runtime-processes.txt | cut -d' ' -f1), \"cpu_usage\": \"minimal\", \"memory_usage\": \"minimal\"}" > runtime-analysis.json
-          
-          echo "Stopping container..."
-          docker stop $CONTAINER_ID
-          docker rm $CONTAINER_ID
-          EOF
-          
-          chmod +x runtime-test.sh
-          ./runtime-test.sh || echo "Runtime analysis failed but continuing"
-          
-          # Generate report
-          cat > security-tests/reports/runtime-security-report.md << EOF
-          # Security Test: Runtime Security Analysis
-          
-          This test analyzes the runtime behavior of the container for potential security issues.
-          
-          ## Runtime Analysis
-          
-          \`\`\`json
-          $(cat runtime-analysis.json 2>/dev/null || echo "{\"error\": \"Runtime analysis could not be completed\"}")
-          \`\`\`
-          
-          ## Process List
-          
-          \`\`\`
-          $(cat runtime-processes.txt 2>/dev/null || echo "Process list could not be generated")
-          \`\`\`
-          
-          ## Security Value
-          
-          - **Behavioral Analysis**: Identifies unexpected runtime behavior that could indicate security issues
-          - **Resource Validation**: Ensures container uses resources as expected
-          - **Privilege Checking**: Verifies container runs with appropriate privileges
-          - **Runtime Integrity**: Confirms runtime behavior matches expected patterns
-          EOF
-      
-      - name: Generate comprehensive test report
-        run: |
-          # Create a comprehensive report that includes all test results
-          cat > security-tests/comprehensive-security-test-report.md << EOF
-          # BioGears Comprehensive Security Testing Report
-          
-          This report summarizes the security tests performed on the BioGears container image and associated artifacts.
-          
-          ## Test Summary
-          
-          | Test | Status | Description |
-          |------|--------|-------------|
-          | CIS Docker Benchmark | ✅ Completed | Evaluates Docker configuration against CIS benchmarks |
-          | Container Image Scanning | ✅ Completed | Scans container for vulnerabilities, misconfigurations, and secrets |
-          | SBOM & License Verification | ✅ Completed | Verifies SBOM completeness and license compliance |
-          | Runtime Security Analysis | ✅ Completed | Analyzes container runtime behavior for security issues |
-          
-          ## Testing Value in Software Supply Chain
-          
-          Each phase of testing provides critical security validation:
-          
-          1. **Build Phase Testing**: Validates the build environment and process security
-          2. **Artifact Testing**: Ensures artifacts are free from vulnerabilities
-          3. **Configuration Testing**: Verifies secure configuration practices
-          4. **Runtime Testing**: Confirms secure behavior during execution
-          
-          ## Integration with Supply Chain Security
-          
-          These tests complement the attestations and verifications in the supply chain:
-          
-          - **SBOM verification** ensures no unexpected or malicious components are included
-          - **Container scanning** provides evidence of security characteristics
-          - **Runtime analysis** verifies the container behaves as expected
-          - **Benchmark testing** confirms the infrastructure meets security standards
-          
-          This multi-layered approach creates defense-in-depth for the entire software supply chain.
-          EOF
-      
-      - name: Upload test reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-test-reports
-          path: security-tests/
