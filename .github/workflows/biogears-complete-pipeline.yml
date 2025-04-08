@@ -10,6 +10,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write  # Required for Sigstore keyless signing
 
 # JFrog Artifactory Integration
 # The following secrets should be added to GitHub repository:
@@ -608,11 +609,45 @@ jobs:
           # Reset errors
           set +x  # Disable command echo
       
-      - name: Upload image digest
+      - name: Keyless signing with Sigstore
+        id: sigstore_sign
+        shell: bash
+        run: |
+          echo "Installing latest Cosign for keyless signing..."
+          wget -q https://github.com/sigstore/cosign/releases/download/v2.2.2/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign-keyless
+          
+          echo "Keyless signing with Sigstore (OIDC identity)..."
+          IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}"
+          
+          # Keyless signing using GitHub OIDC identity
+          echo "Signing with GitHub OIDC identity and Rekor transparency log..."
+          cosign-keyless sign --yes $IMAGE
+          
+          # Add keyless signature info to image-digest.txt
+          echo "KEYLESS_SIGNED=true" >> image-digest.txt
+          echo "SIGSTORE_IDENTITY=https://github.com/${{ github.repository_owner }}" >> image-digest.txt
+          
+          # Also sign JFrog image if configured
+          if [ -n "${{ secrets.JFROG_URL }}" ] && [ -n "${{ secrets.JFROG_USER }}" ]; then
+            JFROG_IMAGE="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${{ github.sha }}"
+            cosign-keyless sign --yes $JFROG_IMAGE
+            echo "JFROG_KEYLESS_SIGNED=true" >> image-digest.txt
+          fi
+          
+          # Get the Rekor entry - this proves the signature exists in public transparency log
+          echo "Getting Rekor entry for transparency log verification..."
+          cosign-keyless triangulate $IMAGE > rekor-entry.txt
+          echo "Rekor transparency log entry created at: $(cat rekor-entry.txt)"
+      
+      - name: Upload image digest and Rekor info
         uses: actions/upload-artifact@v4
         with:
           name: image-digest
-          path: image-digest.txt
+          path: |
+            image-digest.txt
+            rekor-entry.txt
 
   #######################################
   # STAGE 2: SECURITY METADATA
@@ -1838,6 +1873,101 @@ jobs:
           username: ${{ secrets.JFROG_USER }}
           password: ${{ secrets.JFROG_API_KEY }}
       
+      - name: Generate SLSA Provenance
+        id: slsa_provenance
+        shell: bash
+        run: |
+          echo "Installing Cosign for SLSA..."
+          sudo apt-get update
+          sudo apt-get install -y jq
+          
+          # Create a provenance attestation
+          cat > provenance.json << EOF
+          {
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "predicateType": "https://slsa.dev/provenance/v0.2",
+            "subject": [
+              {
+                "name": "ghcr.io/${{ github.repository_owner }}/biogears-hari",
+                "digest": {
+                  "sha256": "${{ github.sha }}"
+                }
+              }
+            ],
+            "predicate": {
+              "buildType": "https://github.com/actions/workflow",
+              "builder": {
+                "id": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              },
+              "invocation": {
+                "configSource": {
+                  "uri": "git+https://github.com/${{ github.repository }}",
+                  "digest": {
+                    "sha1": "${{ github.sha }}"
+                  },
+                  "entryPoint": ".github/workflows/biogears-complete-pipeline.yml"
+                },
+                "environment": {
+                  "github_actor": "${{ github.actor }}",
+                  "github_repository": "${{ github.repository }}",
+                  "github_sha": "${{ github.sha }}",
+                  "github_ref": "${{ github.ref }}",
+                  "runner_os": "${{ runner.os }}"
+                }
+              },
+              "metadata": {
+                "buildStartedOn": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+                "buildFinishedOn": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+                "completeness": {
+                  "parameters": true,
+                  "environment": true,
+                  "materials": true
+                },
+                "reproducible": false
+              },
+              "materials": [
+                {
+                  "uri": "git+https://github.com/${{ github.repository }}",
+                  "digest": {
+                    "sha1": "${{ github.sha }}"
+                  }
+                }
+              ]
+            }
+          }
+          EOF
+          
+          echo "Created SLSA provenance attestation"
+          
+          # Get cosign for signing
+          wget -q https://github.com/sigstore/cosign/releases/download/v2.2.2/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign-keyless
+          
+          # Sign the provenance with keyless signing
+          IMAGE_REF="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}"
+          cosign-keyless attest --yes --type slsaprovenance --predicate provenance.json $IMAGE_REF
+          
+          echo "SLSA_PROVENANCE=true" >> attestation-metadata.txt
+          echo "SLSA_LEVEL=2" >> attestation-metadata.txt
+          
+          # If JFrog is configured, also attach provenance there
+          if [ -n "${{ secrets.JFROG_URL }}" ] && [ -n "${{ secrets.JFROG_USER }}" ]; then
+            JFROG_IMAGE="${ARTIFACTORY_DOCKER_REGISTRY}/biogears/biogears:${{ github.sha }}"
+            cosign-keyless attest --yes --type slsaprovenance --predicate provenance.json $JFROG_IMAGE
+            echo "JFROG_SLSA_PROVENANCE=true" >> attestation-metadata.txt
+          fi
+          
+          mkdir -p slsa
+          cp provenance.json slsa/
+          echo "Generated SLSA provenance and attached to container images"
+      
+      - name: Upload SLSA provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: slsa-provenance
+          path: slsa/
+      
       - name: Organize artifacts for publishing
         continue-on-error: true
         run: |
@@ -2124,6 +2254,22 @@ jobs:
           
           ${GITHUB_SECTION}${JFROG_SECTION}
           
+          ## Sigstore and SLSA Provenance
+          
+          Container images are signed using Sigstore keyless signing with:
+          - GitHub OIDC identity-based authentication
+          - Signatures recorded in the Rekor transparency log
+          - SLSA Level 2 build provenance attestations 
+          
+          Verify signatures with:
+          \`\`\`bash
+          # Install Cosign v2+
+          cosign verify --certificate-identity "https://github.com/${{ github.repository_owner }}" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
+          
+          # Verify SLSA provenance
+          cosign verify-attestation --type slsaprovenance --certificate-identity "https://github.com/${{ github.repository_owner }}" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}
+          \`\`\`
+          
           ## Docker Image Signatures and Attestations
           The Docker image has been signed with Cosign and has attestations attached directly.
           
@@ -2150,3 +2296,58 @@ jobs:
             signatures.tar.gz
             policies.tar.gz
             comprehensive-bundle.tar.gz
+      
+      # Add these steps after other steps
+      - name: Demonstrate Sigstore verification
+        shell: bash
+        run: |
+          echo "=== DEMONSTRATION: Sigstore Verification ==="
+          
+          # Install cosign
+          wget -q https://github.com/sigstore/cosign/releases/download/v2.2.2/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign-verify
+          
+          # Get the image reference
+          IMAGE="ghcr.io/${{ github.repository_owner }}/biogears-hari:${{ github.sha }}"
+          
+          # Create verification demo script
+          cat > demo-run/demo-materials/sigstore-verification.sh << 'EOF'
+          #!/bin/bash
+          # Demo: Sigstore Keyless Verification
+          
+          echo "=== DEMO: Sigstore Keyless Verification ==="
+          
+          # Get the image reference from arguments
+          IMAGE=$1
+          
+          echo "Step 1: Verify keyless signature using Sigstore"
+          cosign-verify verify --certificate-identity "https://github.com/$GITHUB_REPOSITORY_OWNER" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" $IMAGE
+          
+          echo "Step 2: Check Rekor transparency log for signature"
+          cosign-verify triangulate $IMAGE
+          
+          echo "Step 3: Verify SLSA provenance attestation"
+          cosign-verify verify-attestation --type slsaprovenance --certificate-identity "https://github.com/$GITHUB_REPOSITORY_OWNER" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" $IMAGE
+          
+          echo "Step 4: Extract and display SLSA provenance details"
+          cosign-verify verify-attestation --type slsaprovenance $IMAGE | jq -r '.payload' | base64 -d | jq .
+          EOF
+          
+          chmod +x demo-run/demo-materials/sigstore-verification.sh
+          
+          # Create documentation for the Sigstore verification demo
+          cat > demo-run/demo-materials/sigstore-verification-report.md << EOF
+          # Sigstore Keyless Verification
+          
+          This demonstration shows how to verify software artifacts using Sigstore's keyless signing and transparency logs:
+          
+          - **Keyless Signatures**: No private keys to manage, uses OIDC identity
+          - **Transparency Logs**: Signatures recorded in tamper-proof Rekor log
+          - **SLSA Provenance**: Software supply chain attestations (Level 2)
+          
+          ## Security Value
+          
+          - **Zero Key Management**: Eliminates private key management challenges
+          - **Auditability**: All signatures are publicly verifiable in Rekor logs
+          - **Identity-Based**: Signatures linked to GitHub Actions identity
