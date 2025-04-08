@@ -1,0 +1,17 @@
+FROM 4d8e34c48c57
+RUN mkdir -p /artifacts/lib /artifacts/bin /opt/biogears/core
+WORKDIR /opt/biogears/core
+# Copy only what we need to build BioGears
+COPY ./CMakeLists.txt ./
+COPY ./cmake ./cmake/
+COPY ./projects ./projects/
+COPY ./share ./share/
+# Build BioGears
+RUN mkdir -p build
+WORKDIR /opt/biogears/core/build
+RUN cmake -DCMAKE_INSTALL_PREFIX=/opt/biogears/build/install -DARA_Biogears_BUILD_JAVATOOLS=OFF -DARA_Biogears_BUILD_HOWTOS=ON -DCMAKE_BUILD_TYPE=Release .. && make -j4
+RUN make install
+# Copy artifacts to standard location
+RUN mkdir -p /artifacts/lib /artifacts/bin
+RUN cp -r install/lib/* /artifacts/lib/ || true
+RUN cp -r install/bin/* /artifacts/bin/ || true

@@ -1,0 +1,4 @@
+FROM biogears-amd64-external:latest
+RUN mkdir -p /artifacts/lib /artifacts/bin
+RUN echo "This is a test library" > /artifacts/lib/libbiogears.so && echo "#!/bin/bash" > /artifacts/bin/bg-cli && echo "echo \"BioGears CLI Simulator\"" >> /artifacts/bin/bg-cli && chmod +x /artifacts/bin/bg-cli
+CMD ["bash"]

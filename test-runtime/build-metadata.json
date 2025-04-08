@@ -1,0 +1,8 @@
+{
+  "builder_id": "github-actions-docker",
+  "build_type": "Release",
+  "source_repo": "https://github.com/hari-ara/biogears-hari",
+  "commit_hash": "test123456789",
+  "build_timestamp": "2025-04-07T20:00:00Z",
+  "build_platform": "linux"
+}
